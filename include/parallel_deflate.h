@@ -1,0 +1,58 @@
+#pragma once
+// parallel_deflate.h
+// Multi-threaded CPU DEFLATE using a persistent ThreadPool.
+//
+// Each strip is divided into N chunks.  Chunks are compressed independently
+// in parallel (raw DEFLATE, windowBits = -15).  The results are byte-aligned
+// at every boundary (Z_FULL_FLUSH for non-terminal chunks, Z_FINISH for the
+// absolute last chunk).  Concatenation produces a valid DEFLATE bitstream.
+//
+// Adler-32 is computed per chunk and combined with adler32_combine() so that
+// the caller can append the correct zlib trailer after all strips.
+
+#include "thread_pool.h"
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+// Compression settings
+struct ParallelDeflateConfig {
+    int num_threads = 6;   // chunks per strip (matches i5-9400F physical cores)
+    int zlib_level  = 3;   // 1=fastest, 9=best ratio; 3 is recommended default
+};
+
+// Per-strip result returned by deflate_strip().
+// Carries its own adler32 contribution so the caller can accumulate in order.
+struct DeflateResult {
+    std::vector<uint8_t> data;         // raw DEFLATE bytes (no zlib header/trailer)
+    unsigned long        strip_adler;  // adler32 of uncompressed input bytes
+    size_t               input_size;   // byte count of uncompressed input
+};
+
+// Running checksum accumulated across all strips in sequence.
+struct ParallelDeflateState {
+    unsigned long running_adler = 1;   // adler32 neutral initial value (RFC 1950)
+    bool          started       = false;
+};
+
+// Compress one strip's filtered row data using the persistent thread pool.
+// is_last must be true for the final strip of the image so the DEFLATE
+// bitstream is properly terminated (BFINAL=1).
+DeflateResult deflate_strip(
+    const uint8_t*               input,
+    size_t                       input_size,
+    const ParallelDeflateConfig& cfg,
+    ThreadPool&                  pool,
+    bool                         is_last);
+
+// Accumulate one strip's adler32 contribution into state.
+// Must be called in strip order (0, 1, 2, …).
+void accum_adler(ParallelDeflateState& state, const DeflateResult& dr);
+
+// Build the 2-byte zlib stream header for the given compression level.
+// Write this before the first DEFLATE byte in the IDAT stream.
+void zlib_header(int level, uint8_t out[2]);
+
+// Build the 4-byte big-endian Adler-32 trailer.
+// Write this after the last DEFLATE byte in the IDAT stream.
+void zlib_trailer(const ParallelDeflateState& state, uint8_t out[4]);
