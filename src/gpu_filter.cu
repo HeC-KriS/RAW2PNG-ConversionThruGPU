@@ -265,15 +265,124 @@ size_t gpu_filter_output_size(const GpuFilterContext* ctx, int actual_rows)
     return (size_t)actual_rows * (ctx->width_bytes + 1);
 }
 
-// Internal: run the three kernels, DMA result to pinned host memory, and
-// optionally fill *timings with per-phase millisecond measurements.
-// The h2d_done event must already have been recorded by the caller before
-// this function is called (it marks the end of the H2D upload).
+// ---------------------------------------------------------------------------
+// DICOM pixel preprocessing kernel
+//
+// Runs in-place on d_input before the PNG filter kernels.
+// Transforms raw little-endian DICOM samples to big-endian PNG-ready samples:
+//   1. bit-depth normalisation  (shift away unused high bits)
+//   2. signed → unsigned offset binary (if pixel_rep == 1)
+//   3. rescale slope / intercept
+//   4. window / level clamp
+//   5. byte-swap to big-endian (16-bit only)
+//
+// One thread handles one sample (one colour channel of one pixel).
+// Grid: ceil(total_samples / 256) × 1   Block: 256 × 1
+// ---------------------------------------------------------------------------
+// In-place kernel: reads and writes the same buffer (d_inout).
+// NOT __restrict__ on d_inout because d_in and d_out are the same pointer;
+// using __restrict__ on an aliased pointer is undefined behaviour.
+__global__ void dicom_preprocess_kernel(
+    uint8_t*     d_inout,
+    int          total_samples,
+    DicomPixelParams p)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_samples) return;
+
+    // Local aliases for clarity; all reads must precede writes for this thread.
+    const uint8_t* d_in  = d_inout;
+    uint8_t*       d_out = d_inout;
+
+    const int out_maxval = (p.bits_allocated == 16) ? 65535 : 255;
+    float val;
+
+    if (p.bits_allocated == 16) {
+        // Read DICOM native (little-endian) 16-bit sample
+        uint16_t raw = (uint16_t)d_in[idx * 2]
+                     | ((uint16_t)d_in[idx * 2 + 1] << 8);
+
+        // Right-align: shift = HighBit − BitsStored + 1
+        //   Right-aligned (common): HighBit = BitsStored-1 → shift = 0
+        //   Left-aligned  (rare):   HighBit = BitsAllocated-1 → shift = BitsAllocated-BitsStored
+        int bit_shift = p.high_bit - p.bits_stored + 1;
+        if (bit_shift > 0) raw = (uint16_t)(raw >> bit_shift);
+
+        // Mask to exactly bits_stored bits (defensive: DICOM spec requires unused bits = 0
+        // but real-world files occasionally have garbage in the padding bits)
+        if (p.bits_stored < 16) {
+            uint32_t mask = (1u << p.bits_stored) - 1u;
+            raw = (uint16_t)(raw & (uint16_t)mask);
+        }
+
+        if (p.pixel_rep == 1) {
+            // Two's complement sign extension, then apply rescale to the signed value.
+            // Rescale slope/intercept in DICOM always applies to the raw signed integer,
+            // NOT to an unsigned-shifted representation.
+            int32_t sv;
+            if (p.bits_stored == 16) {
+                sv = (int32_t)(int16_t)raw;
+            } else {
+                int bits = p.bits_stored;
+                int half = 1 << (bits - 1);
+                sv = (int32_t)(raw);
+                if (sv >= half) sv -= (1 << bits);  // two's complement → signed int
+            }
+            // Apply rescale to signed value, then shift to unsigned for window/output
+            if (p.apply_rescale)
+                val = (float)sv * p.rescale_slope + p.rescale_intercept;
+            else
+                val = (float)sv;
+        } else {
+            // Unsigned: rescale applies directly to the unsigned integer
+            val = (float)raw;
+            if (p.apply_rescale)
+                val = val * p.rescale_slope + p.rescale_intercept;
+        }
+    } else {
+        // 8-bit: single unsigned byte per sample
+        val = (float)d_in[idx];
+        if (p.apply_rescale)
+            val = val * p.rescale_slope + p.rescale_intercept;
+    }
+
+    if (p.apply_window) {
+        float lo = p.window_center - p.window_width * 0.5f;
+        val = (val - lo) / p.window_width * (float)out_maxval;
+    }
+
+    val = fmaxf(0.f, fminf((float)out_maxval, val));
+    uint32_t ov = (uint32_t)val;
+
+    if (p.bits_allocated == 16) {
+        // Write big-endian (PNG / network byte order)
+        d_out[idx * 2]     = (uint8_t)(ov >> 8);
+        d_out[idx * 2 + 1] = (uint8_t)(ov & 0xFF);
+    } else {
+        d_out[idx] = (uint8_t)ov;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: run kernels, DMA result to pinned host memory, fill timings.
+// ev_h2d_done must already be recorded by the caller.
+// ---------------------------------------------------------------------------
 static const uint8_t* run_kernels(GpuFilterContext* ctx, int actual_rows,
-                                   GpuTimings* timings)
+                                   GpuTimings* timings, const DicomPixelParams* dicom)
 {
     const int W  = ctx->width_bytes;
     const int SH = ctx->strip_height;
+
+    // Optional DICOM pixel preprocessing (in-place on d_input)
+    // Must run before multi_filter_kernel; stream ordering guarantees sequencing.
+    if (dicom) {
+        // total_samples = number of individual colour-channel values in the strip
+        int total_samples = actual_rows * W / (dicom->bits_allocated / 8);
+        dim3 dblk(256);
+        dim3 dgrd((total_samples + 255) / 256);
+        dicom_preprocess_kernel<<<dgrd, dblk, 0, ctx->stream>>>(
+            ctx->d_input, total_samples, *dicom);
+    }
 
     // Kernel 1 – multi_filter
     {
@@ -337,11 +446,12 @@ static const uint8_t* run_kernels(GpuFilterContext* ctx, int actual_rows,
 }
 
 const uint8_t* gpu_filter_process_from_device(
-    GpuFilterContext*  ctx,
-    const uint8_t*     d_input,
-    const uint8_t*     d_prior_row,
-    int                actual_rows,
-    GpuTimings*        timings)
+    GpuFilterContext*       ctx,
+    const uint8_t*          d_input,
+    const uint8_t*          d_prior_row,
+    int                     actual_rows,
+    GpuTimings*             timings,
+    const DicomPixelParams* dicom)
 {
     CHECK_CUDA(cudaEventRecord(ctx->ev_start, ctx->stream));
     const size_t strip_bytes = (size_t)actual_rows * ctx->width_bytes;
@@ -351,15 +461,16 @@ const uint8_t* gpu_filter_process_from_device(
         CHECK_CUDA(cudaMemcpyAsync(ctx->d_prior, d_prior_row,
                                    ctx->width_bytes, cudaMemcpyDeviceToDevice, ctx->stream));
     CHECK_CUDA(cudaEventRecord(ctx->ev_h2d_done, ctx->stream));
-    return run_kernels(ctx, actual_rows, timings);
+    return run_kernels(ctx, actual_rows, timings, dicom);
 }
 
 const uint8_t* gpu_filter_process_from_host(
-    GpuFilterContext*  ctx,
-    const uint8_t*     h_input,
-    const uint8_t*     h_prior_row,
-    int                actual_rows,
-    GpuTimings*        timings)
+    GpuFilterContext*       ctx,
+    const uint8_t*          h_input,
+    const uint8_t*          h_prior_row,
+    int                     actual_rows,
+    GpuTimings*             timings,
+    const DicomPixelParams* dicom)
 {
     CHECK_CUDA(cudaEventRecord(ctx->ev_start, ctx->stream));
     const size_t strip_bytes = (size_t)actual_rows * ctx->width_bytes;
@@ -369,5 +480,5 @@ const uint8_t* gpu_filter_process_from_host(
         CHECK_CUDA(cudaMemcpyAsync(ctx->d_prior, h_prior_row,
                                    ctx->width_bytes, cudaMemcpyHostToDevice, ctx->stream));
     CHECK_CUDA(cudaEventRecord(ctx->ev_h2d_done, ctx->stream));
-    return run_kernels(ctx, actual_rows, timings);
+    return run_kernels(ctx, actual_rows, timings, dicom);
 }

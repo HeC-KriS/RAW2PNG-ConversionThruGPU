@@ -5,6 +5,7 @@
     "libpng",
     "tiff",
     "zlib",
-    "libraw"
+    "libraw",
+    "dcmtk"
   ]
 }

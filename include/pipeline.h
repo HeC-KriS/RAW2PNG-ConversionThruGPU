@@ -8,12 +8,17 @@ struct PipelineConfig {
     bool verbose          = false;
 };
 
-// Encode a TIFF or BigTIFF file to PNG using the GPU filter pipeline.
 bool encode_tiff_to_png(const char* input_path,
                         const char* output_path,
                         const PipelineConfig& cfg);
 
-// Encode a RAW camera file (CR2/NEF/DNG/ARW…) to PNG using LibRaw.
 bool encode_raw_to_png(const char* input_path,
                        const char* output_path,
                        const PipelineConfig& cfg);
+
+// Encode an uncompressed DICOM file to PNG.
+// GPU-accelerated pixel transforms (bit-depth, sign, rescale, window/level)
+// are applied on the fly before PNG filtering.
+bool encode_dicom_to_png(const char* input_path,
+                         const char* output_path,
+                         const PipelineConfig& cfg);
