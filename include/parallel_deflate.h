@@ -27,6 +27,10 @@ struct DeflateResult {
     std::vector<uint8_t> data;         // raw DEFLATE bytes (no zlib header/trailer)
     unsigned long        strip_adler;  // adler32 of uncompressed input bytes
     size_t               input_size;   // byte count of uncompressed input
+    // Diagnostic timing (sum across all parallel chunks in this strip, in μs).
+    // Wall-time cost = each field / num_threads  (chunks run in parallel).
+    long long            init_us     = 0;  // time in z_stream acquire/reset
+    long long            compress_us = 0;  // time inside deflate() call
 };
 
 // Running checksum accumulated across all strips in sequence.
@@ -56,3 +60,9 @@ void zlib_header(int level, uint8_t out[2]);
 // Build the 4-byte big-endian Adler-32 trailer.
 // Write this after the last DEFLATE byte in the IDAT stream.
 void zlib_trailer(const ParallelDeflateState& state, uint8_t out[4]);
+
+// Standalone DEFLATE throughput benchmark.
+// Compresses strip_bytes of synthetic data at levels 0, 1, and 3 using
+// num_threads parallel chunks, prints a throughput table to stdout.
+// Use --bench-deflate to invoke from the CLI.
+void bench_deflate(size_t strip_bytes, int num_threads);

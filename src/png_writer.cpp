@@ -37,6 +37,11 @@ bool PngWriter::open(const char* path,
     file_ = fopen(path, "wb");
     if (!file_) return false;
 
+    // Use a 512 KB stdio buffer to batch OS writes.  The IDAT buffer is 32 KB
+    // so a 56 MB compressed file would otherwise produce ~1700 fwrite calls;
+    // this reduces them to ~107 at no cost to IDAT chunk semantics.
+    setvbuf(file_, nullptr, _IOFBF, 512 * 1024);
+
     // Signature
     fwrite(PNG_SIG, 1, 8, file_);
 

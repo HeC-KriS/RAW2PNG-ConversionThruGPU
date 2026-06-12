@@ -28,6 +28,9 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <filesystem>
+#include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -111,6 +114,12 @@ struct PipelineStats {
     std::atomic<long long> gpu_h2d_us{0};
     std::atomic<long long> gpu_kernel_us{0};
     std::atomic<long long> gpu_d2h_us{0};
+
+    // Deflate sub-phase totals in microseconds.
+    // Summed across all parallel chunks across all strips.
+    // Wall cost = sum / num_threads  (chunks run in parallel within each strip).
+    std::atomic<long long> deflate_init_us{0};
+    std::atomic<long long> deflate_compress_us{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -214,6 +223,8 @@ static void deflate_stage(
         auto t1 = std::chrono::high_resolution_clock::now();
         stats.deflate_ms +=
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        stats.deflate_init_us     += dr.init_us;
+        stats.deflate_compress_us += dr.compress_us;
         stats.deflate_count++;
 
         CompressedJob cjob;
@@ -266,23 +277,38 @@ static void writer_stage(
 }
 
 // ---------------------------------------------------------------------------
-// Internal: run the 4-stage pipeline for any ImageSource
+// Internal: run the 4-stage pipeline for ONE image/frame using a caller-owned
+// GPU context and thread pool (both reusable across frames).
+//
+//   print_header : print the one-line source/DICOM header before running
+//   print_report : print the full per-frame timing report after running
+//
+// The GPU prior-row state is reset here so reused contexts start each frame
+// with zeros for the first row's Up/Paeth predictors.
 // ---------------------------------------------------------------------------
-static bool run_pipeline(
+static bool run_one(
     const PipelineConfig& cfg,
     const char*           output_path,
     const char*           source_label,
-    ImageSource&          src)
+    ImageSource&          src,
+    GpuFilterContext*     gpu,
+    ThreadPool&           pool,
+    bool                  print_header,
+    bool                  print_report)
 {
     const ImageInfo& info   = src.info();
     const int        strip_h = cfg.strip_height;
     const size_t     row_b   = (size_t)info.width * info.bpp;
     const DicomPixelParams* dicom = src.dicom_params();
 
+    // Reset per-image GPU state (prior row) — required when reusing a context
+    // across multiple frames.
+    gpu_filter_reset(gpu);
+
     // Wall-clock start timestamp (absolute, for the timing report)
     auto t_abs_start = std::chrono::system_clock::now();
 
-    if (cfg.verbose) {
+    if (print_header) {
         char ts[16];
         fmt_timestamp(t_abs_start, ts);
         fprintf(stdout, "[%s] %s  %ux%u  ch=%d  bps=%d  strip_h=%d  threads=%d  level=%d\n",
@@ -292,8 +318,9 @@ static bool run_pipeline(
         if (dicom) {
             int shift = dicom->high_bit - dicom->bits_stored + 1;
             fprintf(stdout,
-                "         DICOM  bits_alloc=%d  bits_stored=%d  high_bit=%d"
+                "         DICOM  frames=%d  bits_alloc=%d  bits_stored=%d  high_bit=%d"
                 "  shift=%d  pixel_rep=%d  rescale=%s  window=%s\n",
+                src.num_frames(),
                 dicom->bits_allocated, dicom->bits_stored, dicom->high_bit,
                 shift, dicom->pixel_rep,
                 dicom->apply_rescale ? "yes" : "no",
@@ -301,13 +328,6 @@ static bool run_pipeline(
         }
     }
 
-    GpuFilterContext* gpu = gpu_filter_create(info.width, info.bpp, strip_h);
-    if (!gpu) {
-        fprintf(stderr, "gpu_filter_create failed\n");
-        return false;
-    }
-
-    ThreadPool pool(cfg.deflate_threads);
     ParallelDeflateConfig dcfg;
     dcfg.num_threads = cfg.deflate_threads;
     dcfg.zlib_level  = cfg.deflate_level;
@@ -317,7 +337,6 @@ static bool run_pipeline(
                      (uint8_t)info.bits_per_sample,
                      channels_to_color_type(info.channels))) {
         fprintf(stderr, "Cannot open output: %s\n", output_path);
-        gpu_filter_destroy(gpu);
         return false;
     }
     writer.begin_idat();
@@ -354,9 +373,8 @@ static bool run_pipeline(
 
     writer.end_idat();
     writer.close();
-    gpu_filter_destroy(gpu);
 
-    if (cfg.verbose) {
+    if (print_report) {
         double wall_ms =
             (double)std::chrono::duration_cast<std::chrono::microseconds>(
                 t_wall_end - t_wall_start).count() / 1000.0;
@@ -392,6 +410,20 @@ static bool run_pipeline(
 
         fprintf(stdout, "Deflate          : %lld ms  (%lld strips)\n",
                 stats.deflate_ms.load(), stats.deflate_count.load());
+        {
+            long long nt      = (long long)dcfg.num_threads;
+            long long init_ms = stats.deflate_init_us.load() / 1000LL;
+            long long cmp_ms  = stats.deflate_compress_us.load() / 1000LL;
+            // These are sums across all parallel chunks; divide by thread count
+            // to get the wall-clock contribution.
+            fprintf(stdout,
+                "  z_stream init  : %lld ms total (%lld ms wall, %lld chunks)\n",
+                init_ms, init_ms / nt,
+                stats.deflate_count.load() * nt);
+            fprintf(stdout,
+                "  deflate()      : %lld ms total (%lld ms wall)\n",
+                cmp_ms, cmp_ms / nt);
+        }
         fprintf(stdout, "Writer           : %lld ms  (%lld strips)\n",
                 stats.write_ms.load(), stats.write_count.load());
 
@@ -399,6 +431,32 @@ static bool run_pipeline(
     }
 
     return !error.load();
+}
+
+// ---------------------------------------------------------------------------
+// Internal: single-image convenience wrapper.
+// Builds a GPU context + thread pool, runs one image, tears them down.
+// ---------------------------------------------------------------------------
+static bool run_pipeline(
+    const PipelineConfig& cfg,
+    const char*           output_path,
+    const char*           source_label,
+    ImageSource&          src)
+{
+    const ImageInfo& info = src.info();
+
+    GpuFilterContext* gpu = gpu_filter_create(info.width, info.bpp, cfg.strip_height);
+    if (!gpu) {
+        fprintf(stderr, "gpu_filter_create failed\n");
+        return false;
+    }
+    ThreadPool pool(cfg.deflate_threads);
+
+    bool ok = run_one(cfg, output_path, source_label, src, gpu, pool,
+                      cfg.verbose, cfg.verbose);
+
+    gpu_filter_destroy(gpu);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,5 +492,83 @@ bool encode_dicom_to_png(const char* input_path,
 {
     DicomSource src;
     if (!src.open(input_path)) return false;
+
+    const int frame = (cfg.frame >= 0) ? cfg.frame : 0;
+    if (frame >= src.num_frames()) {
+        fprintf(stderr, "DICOM: requested frame %d but file has %d frame(s)\n",
+                frame, src.num_frames());
+        return false;
+    }
+    if (cfg.verbose && src.num_frames() > 1)
+        fprintf(stdout, "DICOM: %d frames; exporting frame %d\n",
+                src.num_frames(), frame);
+
+    if (!src.load_frame(frame)) return false;
     return run_pipeline(cfg, output_path, "DICOM", src);
+}
+
+bool encode_dicom_all_frames_to_png(const char* input_path,
+                                    const char* output_dir,
+                                    const PipelineConfig& cfg)
+{
+    DicomSource src;
+    if (!src.open(input_path)) return false;
+
+    const int n = src.num_frames();
+
+    // Create the output folder (and any parents).
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir, ec);
+    if (ec) {
+        fprintf(stderr, "Cannot create output folder '%s': %s\n",
+                output_dir, ec.message().c_str());
+        return false;
+    }
+
+    fprintf(stdout, "Detected %d frame%s\n", n, (n == 1 ? "" : "s"));
+    fprintf(stdout, "Exporting all frames...\n");
+
+    // Build GPU context + thread pool once; reuse across every frame.
+    const ImageInfo& info = src.info();
+    GpuFilterContext* gpu = gpu_filter_create(info.width, info.bpp, cfg.strip_height);
+    if (!gpu) {
+        fprintf(stderr, "gpu_filter_create failed\n");
+        return false;
+    }
+    ThreadPool pool(cfg.deflate_threads);
+
+    bool all_ok = true;
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < n; i++) {
+        if (!src.load_frame(i)) { all_ok = false; break; }
+
+        char fname[32];
+        snprintf(fname, sizeof(fname), "slice_%04d.png", i);
+        std::filesystem::path outp = std::filesystem::path(output_dir) / fname;
+        const std::string outs = outp.string();
+
+        fprintf(stdout, "[%d/%d] %s\n", i + 1, n, fname);
+
+        // Show the header/report only for the first frame in verbose mode.
+        const bool hdr = cfg.verbose && (i == 0);
+        if (!run_one(cfg, outs.c_str(), "DICOM", src, gpu, pool, hdr, hdr)) {
+            all_ok = false;
+            break;
+        }
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    gpu_filter_destroy(gpu);
+
+    if (all_ok) {
+        double secs =
+            (double)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+            / 1000.0;
+        fprintf(stdout, "Finished exporting %d PNG%s in %.1f s\n",
+                n, (n == 1 ? "" : "s"), secs);
+    } else {
+        fprintf(stderr, "Export aborted after an error.\n");
+    }
+    return all_ok;
 }

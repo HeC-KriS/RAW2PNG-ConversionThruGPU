@@ -359,6 +359,15 @@ size_t gpu_filter_output_size(const GpuFilterContext* ctx, int actual_rows)
     return (size_t)actual_rows * (ctx->width_bytes + 1);
 }
 
+void gpu_filter_reset(GpuFilterContext* ctx)
+{
+    if (!ctx) return;
+    // Zero the prior-row buffer so the first strip of the next frame starts
+    // with zeros for its Up/Paeth predictors (PNG spec, per-image reset).
+    CHECK_CUDA(cudaMemsetAsync(ctx->d_prior, 0, ctx->width_bytes, ctx->stream));
+    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+}
+
 // ---------------------------------------------------------------------------
 // Internal: launch kernels, DMA result to pinned host, fill timings
 // ---------------------------------------------------------------------------

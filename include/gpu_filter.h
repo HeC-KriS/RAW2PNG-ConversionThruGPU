@@ -18,6 +18,11 @@ struct GpuTimings {
 GpuFilterContext* gpu_filter_create(int width, int bpp, int strip_height);
 void              gpu_filter_destroy(GpuFilterContext* ctx);
 
+// Reset per-image filter state (zeros the prior-row buffer). Call this before
+// processing the first strip of a new image/frame when reusing a context, so
+// the first row's Up/Paeth predictors see zeros as the PNG spec requires.
+void              gpu_filter_reset(GpuFilterContext* ctx);
+
 // Process a strip already in device memory.
 // Pass dicom != nullptr to run the DICOM pixel preprocessing kernel before PNG filtering.
 // The kernel transforms raw little-endian DICOM pixel values (bit-depth, sign,

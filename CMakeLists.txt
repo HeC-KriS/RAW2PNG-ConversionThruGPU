@@ -19,6 +19,26 @@ set(CMAKE_CUDA_ARCHITECTURES 35)
 # ---------------------------------------------------------------------------
 find_package(PNG     REQUIRED)
 find_package(TIFF    REQUIRED)
+
+# ---------------------------------------------------------------------------
+# DEFLATE backend
+#
+# The deflate stage is CPU-bound on zlib's level-1 speed (~40 MB/s/core); the
+# 6 worker threads are already saturated, so the only way to cut deflate time
+# materially is a faster zlib-API-compatible codec.
+#
+# zlib-ng (in zlib-compat mode) is a drop-in replacement: it exports the same
+# ZLIB::ZLIB target and the same deflate()/deflateInit2()/adler32() ABI, so NO
+# source changes are needed and the Z_FULL_FLUSH / BFINAL=1 correctness
+# invariant in parallel_deflate.cpp is preserved. Typical speedup: 1.8-2.5x.
+#
+# To switch backends, install the compat build and reconfigure:
+#     vcpkg install zlib-ng[core,zlib-compat]
+# find_package(ZLIB) below then resolves to zlib-ng automatically.
+#
+# libdeflate is intentionally NOT used: it always emits BFINAL=1 and has no
+# Z_FULL_FLUSH equivalent, which breaks the concatenated-stream design.
+# ---------------------------------------------------------------------------
 find_package(ZLIB    REQUIRED)
 find_package(libraw  CONFIG REQUIRED)
 find_package(DCMTK   CONFIG REQUIRED)
@@ -89,6 +109,9 @@ target_link_libraries(gpu_png_encoder PRIVATE
     dicom_lib       # includes DCMTK + OpenJPEG symbols; no INTERFACE flag leakage
 )
 
+target_link_options(gpu_png_encoder PRIVATE /LTCG)
+target_link_options(dicom_lib PRIVATE /LTCG)
+
 # ---------------------------------------------------------------------------
 # NVCC flags
 # ---------------------------------------------------------------------------
@@ -98,11 +121,11 @@ target_compile_options(gpu_png_encoder PRIVATE
         -Wno-deprecated-gpu-targets
         -Xcompiler=/W3
     >
-    $<$<COMPILE_LANGUAGE:CXX>:/W3 /O2>
+    $<$<COMPILE_LANGUAGE:CXX>:/O2 /GL>
 )
 
 target_compile_options(dicom_lib PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:/W3 /O2>
+    $<$<COMPILE_LANGUAGE:CXX>:/O2 /GL>
 )
 
 set_property(TARGET gpu_png_encoder PROPERTY

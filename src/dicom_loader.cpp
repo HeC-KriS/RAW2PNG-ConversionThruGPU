@@ -1,9 +1,15 @@
 // dicom_loader.cpp
 // Loads a DICOM file (any transfer syntax) into RAM and vends pixel strips.
 //
+// Multi-frame:
+//   open() parses headers and NumberOfFrames (0028,0008) but does not decode
+//   pixels. load_frame(i) materialises one frame into pixel_data_. The live
+//   DcmFileFormat is kept in DicomFileImpl so frames can be decoded on demand
+//   without re-reading the file.
+//
 // JPEG2000 decode strategy (dcmjp2k is NOT used):
 //   DCMTK parses the DICOM structure and extracts the raw J2K codestream bytes
-//   from the encapsulated pixel sequence.  OpenJPEG decodes those bytes directly.
+//   from the encapsulated pixel sequence. OpenJPEG decodes those bytes directly.
 //   This approach works regardless of whether DCMTK was compiled with OpenJPEG.
 //
 // Other compressed transfer syntaxes (JPEG, JPEG-LS, RLE):
@@ -41,6 +47,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -73,6 +80,20 @@ static bool is_jpeg2000(const OFString& uid)
     return uid == "1.2.840.10008.1.2.4.90"   // JPEG 2000 Lossless Only
         || uid == "1.2.840.10008.1.2.4.91";  // JPEG 2000 (lossy/lossless)
 }
+
+// ---------------------------------------------------------------------------
+// Opaque per-file decode state (keeps the DcmFileFormat alive across frames)
+// ---------------------------------------------------------------------------
+enum DicomKind { KIND_UNCOMPRESSED = 0, KIND_J2K = 1, KIND_OTHER = 2 };
+
+struct DicomFileImpl {
+    DcmFileFormat     file_format;
+    DcmDataset*       ds            = nullptr;
+    OFString          tsuid;
+    int               kind          = KIND_UNCOMPRESSED;
+    bool              decompressed  = false;  // KIND_OTHER: chooseRepresentation done
+    DcmPixelSequence* pix_seq       = nullptr;// KIND_J2K: cached encapsulated sequence
+};
 
 // ---------------------------------------------------------------------------
 // OpenJPEG memory-stream helpers (callback-based; works with any OPJ 2.x)
@@ -261,7 +282,13 @@ static bool decode_jpeg2000(
 }
 
 // ---------------------------------------------------------------------------
-// DicomSource::open
+// DicomSource ctor/dtor (defined here where DicomFileImpl is complete)
+// ---------------------------------------------------------------------------
+DicomSource::DicomSource() : impl_(new DicomFileImpl()) {}
+DicomSource::~DicomSource() = default;
+
+// ---------------------------------------------------------------------------
+// DicomSource::open — parse metadata + frame count; no pixel decode
 // ---------------------------------------------------------------------------
 bool DicomSource::open(const char* path)
 {
@@ -269,22 +296,23 @@ bool DicomSource::open(const char* path)
     // DCMTK for that and call OpenJPEG directly).
     std::call_once(s_codecs_once, register_dcmtk_codecs);
 
-    DcmFileFormat file_format;
-    OFCondition status = file_format.loadFile(path);
+    DicomFileImpl& F = *impl_;
+
+    OFCondition status = F.file_format.loadFile(path);
     if (status.bad()) {
         fprintf(stderr, "DICOM: cannot load '%s': %s\n", path, status.text());
         return false;
     }
 
-    OFString tsuid;
-    if (file_format.getMetaInfo())
-        file_format.getMetaInfo()->findAndGetOFString(DCM_TransferSyntaxUID, tsuid);
+    if (F.file_format.getMetaInfo())
+        F.file_format.getMetaInfo()->findAndGetOFString(DCM_TransferSyntaxUID, F.tsuid);
 
-    DcmDataset* ds = file_format.getDataset();
-    if (!ds) {
+    F.ds = F.file_format.getDataset();
+    if (!F.ds) {
         fprintf(stderr, "DICOM: no dataset in '%s'\n", path);
         return false;
     }
+    DcmDataset* ds = F.ds;
 
     // ---- Read image geometry and pixel attribute tags ----
     Uint16 rows = 0, cols = 0;
@@ -300,6 +328,23 @@ bool DicomSource::open(const char* path)
 
     if (ds->findAndGetUint16(DCM_HighBit, high_bit).bad())
         high_bit = (Uint16)(bits_stored - 1);  // right-aligned default
+
+    // ---- NumberOfFrames (0028,0008), VR = IS ----
+    // Absent → single frame. Try integer accessor first, fall back to string.
+    {
+        Sint32 nf = 0;
+        if (ds->findAndGetSint32(DCM_NumberOfFrames, nf).good() && nf > 0) {
+            num_frames_ = (int)nf;
+        } else {
+            OFString nfs;
+            if (ds->findAndGetOFString(DCM_NumberOfFrames, nfs).good() && !nfs.empty()) {
+                int v = atoi(nfs.c_str());
+                num_frames_ = (v > 0) ? v : 1;
+            } else {
+                num_frames_ = 1;
+            }
+        }
+    }
 
     if (rows == 0 || cols == 0) {
         fprintf(stderr, "DICOM: invalid dimensions %ux%u in '%s'\n",
@@ -351,16 +396,10 @@ bool DicomSource::open(const char* path)
         params_.window_width  = (float)ww;
     }
 
-    // ---- Extract pixel data (path depends on transfer syntax) ----
+    // ---- Classify transfer syntax and cache decode handles ----
+    if (is_jpeg2000(F.tsuid)) {
+        F.kind = KIND_J2K;
 
-    if (is_jpeg2000(tsuid)) {
-        // ----------------------------------------------------------------
-        // JPEG2000 path: extract encapsulated codestream → OpenJPEG decode
-        //
-        // We do NOT call chooseRepresentation() because DCMTK's dcmjp2k
-        // module may not be compiled in.  Instead we pull the raw J2K bytes
-        // from DcmPixelSequence and decode with OpenJPEG directly.
-        // ----------------------------------------------------------------
         DcmElement* pixElem = nullptr;
         if (ds->findAndGetElement(DCM_PixelData, pixElem).bad() || !pixElem) {
             fprintf(stderr, "DICOM J2K: pixel data element not found in '%s'\n", path);
@@ -372,116 +411,127 @@ bool DicomSource::open(const char* path)
             return false;
         }
 
-        // E_TransferSyntax enum value for this file
-        const E_TransferSyntax xferEnum = (tsuid == "1.2.840.10008.1.2.4.90")
+        const E_TransferSyntax xferEnum = (F.tsuid == "1.2.840.10008.1.2.4.90")
                                         ? EXS_JPEG2000LosslessOnly
                                         : EXS_JPEG2000;
 
-        // getEncapsulatedRepresentation returns the DcmPixelSequence stored in
-        // the dataset — it does NOT call any codec, so it works without dcmjp2k.
-        DcmPixelSequence* pixSeq = nullptr;
+        // getEncapsulatedRepresentation returns the stored DcmPixelSequence
+        // without invoking a codec — works without dcmjp2k.
         const DcmRepresentationParameter* repParam = nullptr;
-        if (pixData->getEncapsulatedRepresentation(xferEnum, repParam, pixSeq).bad()
-            || !pixSeq)
+        if (pixData->getEncapsulatedRepresentation(xferEnum, repParam, F.pix_seq).bad()
+            || !F.pix_seq)
         {
             fprintf(stderr,
                 "DICOM J2K: cannot read encapsulated pixel sequence from '%s'\n"
-                "           Transfer syntax: %s\n", path, tsuid.c_str());
+                "           Transfer syntax: %s\n", path, F.tsuid.c_str());
             return false;
         }
 
-        // Pixel sequence layout:
-        //   Item 0 : Basic Offset Table (may be zero-length; always skip)
-        //   Item 1 : first (and for single-frame DICOM, only) frame
-        DcmPixelItem* frameItem = nullptr;
-        if (pixSeq->getItem(frameItem, 1).bad() || !frameItem) {
+        // Encapsulated layout: item 0 = Basic Offset Table, items 1..N = frames
+        // (assumes one fragment per frame, the near-universal case).
+        const unsigned long n_items = F.pix_seq->card();
+        if (n_items < (unsigned long)num_frames_ + 1) {
             fprintf(stderr,
-                "DICOM J2K: no frame data item in pixel sequence of '%s'\n", path);
+                "DICOM J2K: pixel sequence has %lu items but %d frame(s) expected.\n"
+                "           Multi-fragment frames are not supported.\n",
+                n_items, num_frames_);
             return false;
         }
-
-        Uint8* j2kBytes = nullptr;
-        if (frameItem->getUint8Array(j2kBytes).bad() || !j2kBytes) {
-            fprintf(stderr,
-                "DICOM J2K: cannot read J2K codestream bytes from '%s'\n", path);
-            return false;
-        }
-        const size_t j2kLen = (size_t)frameItem->getLength();
-
-        if (!decode_jpeg2000(j2kBytes, j2kLen,
-                             (int)rows, (int)cols, (int)samples, (int)bits_alloc,
-                             pixel_data_))
-        {
-            fprintf(stderr, "DICOM J2K: pixel decode failed for '%s'\n", path);
-            return false;
-        }
-
-    } else if (is_uncompressed_le(tsuid)) {
-        // ----------------------------------------------------------------
-        // Uncompressed path: direct byte access via getUint8Array
-        // ----------------------------------------------------------------
-        DcmElement* pixel_elem = nullptr;
-        if (ds->findAndGetElement(DCM_PixelData, pixel_elem).bad() || !pixel_elem) {
-            fprintf(stderr, "DICOM: pixel data element not found in '%s'\n", path);
-            return false;
-        }
-        Uint8* px_ptr = nullptr;
-        if (pixel_elem->getUint8Array(px_ptr).bad() || !px_ptr) {
-            fprintf(stderr, "DICOM: cannot access pixel bytes in '%s'\n", path);
-            return false;
-        }
-        const size_t expected =
-            (size_t)rows * cols * samples * (bits_alloc / 8u);
-        if ((size_t)pixel_elem->getLength() < expected) {
-            fprintf(stderr,
-                "DICOM: pixel data too short — got %lu bytes, expected %zu in '%s'\n",
-                (unsigned long)pixel_elem->getLength(), expected, path);
-            return false;
-        }
-        pixel_data_.assign(px_ptr, px_ptr + expected);
-
-    } else {
-        // ----------------------------------------------------------------
-        // Other compressed path: JPEG, JPEG-LS, RLE
-        // Ask DCMTK to decompress to Explicit VR LE in memory.
-        // ----------------------------------------------------------------
-        OFCondition decomp = ds->chooseRepresentation(EXS_LittleEndianExplicit, nullptr);
-        if (decomp.bad()) {
-            fprintf(stderr,
-                "DICOM: cannot decompress '%s'\n"
-                "       Transfer syntax : %s\n"
-                "       DCMTK error     : %s\n",
-                path, tsuid.c_str(), decomp.text());
-            return false;
-        }
-        if (!ds->canWriteXfer(EXS_LittleEndianExplicit)) {
-            fprintf(stderr,
-                "DICOM: decompressed representation unavailable in '%s'\n", path);
-            return false;
-        }
-
-        DcmElement* pixel_elem = nullptr;
-        if (ds->findAndGetElement(DCM_PixelData, pixel_elem).bad() || !pixel_elem) {
-            fprintf(stderr, "DICOM: pixel data element not found in '%s'\n", path);
-            return false;
-        }
-        Uint8* px_ptr = nullptr;
-        if (pixel_elem->getUint8Array(px_ptr).bad() || !px_ptr) {
-            fprintf(stderr, "DICOM: cannot access pixel bytes in '%s'\n", path);
-            return false;
-        }
-        const size_t expected =
-            (size_t)rows * cols * samples * (bits_alloc / 8u);
-        if ((size_t)pixel_elem->getLength() < expected) {
-            fprintf(stderr,
-                "DICOM: pixel data too short — got %lu bytes, expected %zu in '%s'\n",
-                (unsigned long)pixel_elem->getLength(), expected, path);
-            return false;
-        }
-        pixel_data_.assign(px_ptr, px_ptr + expected);
+    }
+    else if (is_uncompressed_le(F.tsuid)) {
+        F.kind = KIND_UNCOMPRESSED;
+    }
+    else {
+        F.kind = KIND_OTHER;   // JPEG / JPEG-LS / RLE — decompressed lazily in load_frame
     }
 
-    next_row_ = 0;
+    cur_frame_ = -1;
+    next_row_  = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// DicomSource::load_frame — materialise one frame's pixels into pixel_data_
+// ---------------------------------------------------------------------------
+bool DicomSource::load_frame(int index)
+{
+    if (index < 0 || index >= num_frames_) {
+        fprintf(stderr, "DICOM: frame index %d out of range [0,%d)\n",
+                index, num_frames_);
+        return false;
+    }
+
+    DicomFileImpl& F = *impl_;
+    const size_t frame_bytes =
+        (size_t)info_.height * info_.width * info_.channels *
+        (size_t)(info_.bits_per_sample / 8);
+
+    if (F.kind == KIND_J2K) {
+        // Frame `index` lives in pixel-sequence item index+1 (item 0 = BOT)
+        DcmPixelItem* item = nullptr;
+        if (F.pix_seq->getItem(item, (unsigned long)(index + 1)).bad() || !item) {
+            fprintf(stderr, "DICOM J2K: cannot get frame item %d\n", index);
+            return false;
+        }
+        Uint8* j2kBytes = nullptr;
+        if (item->getUint8Array(j2kBytes).bad() || !j2kBytes) {
+            fprintf(stderr, "DICOM J2K: cannot read codestream for frame %d\n", index);
+            return false;
+        }
+        const size_t j2kLen = (size_t)item->getLength();
+        if (!decode_jpeg2000(j2kBytes, j2kLen,
+                             (int)info_.height, (int)info_.width,
+                             info_.channels, info_.bits_per_sample,
+                             pixel_data_))
+        {
+            fprintf(stderr, "DICOM J2K: decode failed for frame %d\n", index);
+            return false;
+        }
+    }
+    else {
+        // KIND_OTHER: decompress all frames once into the dataset (Explicit VR LE)
+        if (F.kind == KIND_OTHER && !F.decompressed) {
+            OFCondition decomp =
+                F.ds->chooseRepresentation(EXS_LittleEndianExplicit, nullptr);
+            if (decomp.bad()) {
+                fprintf(stderr,
+                    "DICOM: cannot decompress '%s'\n"
+                    "       Transfer syntax : %s\n"
+                    "       DCMTK error     : %s\n",
+                    "(file)", F.tsuid.c_str(), decomp.text());
+                return false;
+            }
+            if (!F.ds->canWriteXfer(EXS_LittleEndianExplicit)) {
+                fprintf(stderr, "DICOM: decompressed representation unavailable\n");
+                return false;
+            }
+            F.decompressed = true;
+        }
+
+        // Uncompressed (or now-decompressed): all frames concatenated in PixelData
+        DcmElement* pixel_elem = nullptr;
+        if (F.ds->findAndGetElement(DCM_PixelData, pixel_elem).bad() || !pixel_elem) {
+            fprintf(stderr, "DICOM: pixel data element not found\n");
+            return false;
+        }
+        Uint8* px_ptr = nullptr;
+        if (pixel_elem->getUint8Array(px_ptr).bad() || !px_ptr) {
+            fprintf(stderr, "DICOM: cannot access pixel bytes\n");
+            return false;
+        }
+        const size_t total  = (size_t)pixel_elem->getLength();
+        const size_t offset = (size_t)index * frame_bytes;
+        if (offset + frame_bytes > total) {
+            fprintf(stderr,
+                "DICOM: frame %d out of range — need %zu bytes, pixel data has %zu\n",
+                index, offset + frame_bytes, total);
+            return false;
+        }
+        pixel_data_.assign(px_ptr + offset, px_ptr + offset + frame_bytes);
+    }
+
+    cur_frame_ = index;
+    next_row_  = 0;
     return true;
 }
 
