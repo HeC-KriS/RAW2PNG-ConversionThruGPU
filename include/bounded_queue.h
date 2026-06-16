@@ -58,6 +58,15 @@ public:
         return closed_;
     }
 
+    // Current item count -- for queue-depth instrumentation. A snapshot,
+    // not synchronized with any particular push/pop (the queue is
+    // concurrently mutated by other threads), but adequate for periodic
+    // depth sampling/reporting.
+    size_t size() const {
+        std::unique_lock<std::mutex> lk(mtx_);
+        return buf_.size();
+    }
+
 private:
     std::queue<T>           buf_;
     const size_t            cap_;

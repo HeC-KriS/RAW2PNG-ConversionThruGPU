@@ -236,6 +236,16 @@ void zlib_trailer(const ParallelDeflateState& state, uint8_t out[4])
     out[3] = (uint8_t)( a        & 0xFF);
 }
 
+unsigned long adler32_of(const uint8_t* data, size_t len)
+{
+    return adler32(1L, data, (uInt)len);
+}
+
+unsigned long crc32_of(const uint8_t* data, size_t len)
+{
+    return crc32(crc32(0L, nullptr, 0), data, (uInt)len);
+}
+
 // ---------------------------------------------------------------------------
 // bench_deflate – standalone throughput benchmark
 //

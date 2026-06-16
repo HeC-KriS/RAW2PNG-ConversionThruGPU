@@ -359,6 +359,18 @@ size_t gpu_filter_output_size(const GpuFilterContext* ctx, int actual_rows)
     return (size_t)actual_rows * (ctx->width_bytes + 1);
 }
 
+const uint8_t* gpu_filter_device_output(const GpuFilterContext* ctx)
+{
+    return ctx->d_selected;
+}
+
+void gpu_filter_copy_prior_row_to_host(const GpuFilterContext* ctx, uint8_t* h_dst)
+{
+    CHECK_CUDA(cudaMemcpyAsync(h_dst, ctx->d_prior, ctx->width_bytes,
+                               cudaMemcpyDeviceToHost, ctx->stream));
+    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+}
+
 void gpu_filter_reset(GpuFilterContext* ctx)
 {
     if (!ctx) return;

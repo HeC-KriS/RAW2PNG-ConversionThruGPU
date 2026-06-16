@@ -61,6 +61,18 @@ void zlib_header(int level, uint8_t out[2]);
 // Write this after the last DEFLATE byte in the IDAT stream.
 void zlib_trailer(const ParallelDeflateState& state, uint8_t out[4]);
 
+// Thin wrapper over zlib's adler32(), so callers outside parallel_deflate.cpp
+// (e.g. the modern GPU pipeline in pipeline.cpp) don't need their own
+// #include <zlib.h> just to checksum a buffer for accum_adler().
+unsigned long adler32_of(const uint8_t* data, size_t len);
+
+// Thin wrapper over zlib's crc32(), for callers constructing tiny fixed PNG
+// chunks (signature/IHDR/IEND) directly on the host without their own
+// #include <zlib.h> -- e.g. the modern GPU pipeline's run_one_modern(),
+// which only needs gpu_png_assemble.h's GPU-resident path for the bulk IDAT
+// data, not these few dozen constant-ish bytes.
+unsigned long crc32_of(const uint8_t* data, size_t len);
+
 // Standalone DEFLATE throughput benchmark.
 // Compresses strip_bytes of synthetic data at levels 0, 1, and 3 using
 // num_threads parallel chunks, prints a throughput table to stdout.
