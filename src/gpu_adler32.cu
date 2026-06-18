@@ -25,9 +25,12 @@ struct GpuAdler32Context {
     size_t       max_input_bytes;
     size_t       chunk_bytes;
     int          max_blocks;
-    uint32_t*    d_partial;   // [max_blocks] packed (B<<16)|A per sub-chunk
-    uint32_t*    h_partial;   // pinned mirror
+    uint32_t*    d_partial;       // [max_blocks] packed (B<<16)|A per sub-chunk
+    uint32_t*    h_partial;       // pinned mirror
     cudaStream_t stream;
+    // State saved by gpu_adler32_launch() for use by gpu_adler32_collect()
+    size_t       pending_len        = 0;
+    int          pending_num_blocks = 0;
 };
 
 // One thread per block computes its sub-chunk's Adler-32 serially (A/B are
@@ -76,25 +79,39 @@ void gpu_adler32_destroy(GpuAdler32Context* ctx)
     delete ctx;
 }
 
-uint32_t gpu_adler32_compute(GpuAdler32Context* ctx, const uint8_t* d_data, size_t len)
+void gpu_adler32_launch(GpuAdler32Context* ctx, const uint8_t* d_data, size_t len)
 {
-    if (len == 0) return 1u;
+    if (len == 0) {
+        ctx->pending_len        = 0;
+        ctx->pending_num_blocks = 0;
+        return;
+    }
     if (len > ctx->max_input_bytes) {
         fprintf(stderr,
-            "gpu_adler32_compute: len %zu exceeds max_input_bytes %zu from gpu_adler32_create()\n",
+            "gpu_adler32_launch: len %zu exceeds max_input_bytes %zu from gpu_adler32_create()\n",
             len, ctx->max_input_bytes);
         exit(1);
     }
-
     const int num_blocks = (int)((len + ctx->chunk_bytes - 1) / ctx->chunk_bytes);
+    ctx->pending_len        = len;
+    ctx->pending_num_blocks = num_blocks;
 
     adler32_partial_kernel<<<num_blocks, 1, 0, ctx->stream>>>(
         d_data, len, ctx->chunk_bytes, ctx->d_partial);
-
     CHECK_CUDA(cudaMemcpyAsync(ctx->h_partial, ctx->d_partial,
                                sizeof(uint32_t) * num_blocks,
                                cudaMemcpyDeviceToHost, ctx->stream));
+}
+
+uint32_t gpu_adler32_collect(GpuAdler32Context* ctx)
+{
+    if (ctx->pending_len == 0) return 1u;
     CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+
+    const size_t len        = ctx->pending_len;
+    const int    num_blocks = ctx->pending_num_blocks;
+    ctx->pending_len        = 0;
+    ctx->pending_num_blocks = 0;
 
     uint32_t running = 0;
     for (int b = 0; b < num_blocks; b++) {
@@ -105,4 +122,10 @@ uint32_t gpu_adler32_compute(GpuAdler32Context* ctx, const uint8_t* d_data, size
         else        running = (uint32_t)adler32_combine(running, ctx->h_partial[b], (z_off_t)blen);
     }
     return running;
+}
+
+uint32_t gpu_adler32_compute(GpuAdler32Context* ctx, const uint8_t* d_data, size_t len)
+{
+    gpu_adler32_launch(ctx, d_data, len);
+    return gpu_adler32_collect(ctx);
 }

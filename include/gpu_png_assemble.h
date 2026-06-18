@@ -67,3 +67,18 @@ size_t gpu_png_assemble_idat_chunk(GpuPngAssembleContext* ctx,
 // gpu_png_assemble_idat_chunk()'s return value), ready for one fwrite().
 void gpu_png_assemble_copy_to_host(const GpuPngAssembleContext* ctx,
                                    uint8_t* h_dst, size_t num_bytes);
+
+// Per-image PNG assembly timing breakdown (microseconds, cumulative across all
+// chunks produced for one image since the last gpu_png_assemble_reset_stats).
+struct GpuPngAssembleStats {
+    long long chunks        = 0;  // number of IDAT chunks produced
+    long long header_h2d_us = 0;  // H2D: chunk len+type (8B) + optional zlib header (2B)
+    long long data_d2d_us   = 0;  // D2D: compressed slice → GPU chunk buffer + adler trailer
+    long long presync_us    = 0;  // cudaStreamSync stall before CRC kernel can start
+    long long crc_us        = 0;  // CRC32 kernel + partial D2H readback + host combine
+    long long crc_h2d_us    = 0;  // H2D: 4-byte CRC → device buffer + final stream sync
+    long long copy_d2h_us   = 0;  // D2H: assembled chunk → pinned host buffer for fwrite
+};
+
+GpuPngAssembleStats gpu_png_assemble_get_stats(const GpuPngAssembleContext* ctx);
+void                gpu_png_assemble_reset_stats(GpuPngAssembleContext* ctx);

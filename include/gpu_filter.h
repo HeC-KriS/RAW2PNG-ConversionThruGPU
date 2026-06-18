@@ -36,13 +36,20 @@ const uint8_t* gpu_filter_process_from_device(
     const DicomPixelParams* dicom   = nullptr);
 
 // Same as above but uploads h_input from host (pageable) memory first.
+// Set device_output_only=true for the modern GPU-deflate path: skips the
+// D2H copy of d_selected → h_output and its associated stream sync, since
+// the modern path reads d_selected directly via gpu_filter_device_output()
+// and never touches h_output.  gpu_filter_copy_prior_row_to_host() (called
+// immediately after) provides the synchronization barrier that the modern
+// path needs before using d_selected.
 const uint8_t* gpu_filter_process_from_host(
     GpuFilterContext*       ctx,
     const uint8_t*          h_input,
     const uint8_t*          h_prior_row,
     int                     actual_rows,
-    GpuTimings*             timings = nullptr,
-    const DicomPixelParams* dicom   = nullptr);
+    GpuTimings*             timings         = nullptr,
+    const DicomPixelParams* dicom           = nullptr,
+    bool                    device_output_only = false);
 
 // Bytes in the output for a strip of actual_rows rows:
 //   actual_rows * (width * bpp + 1)   (+1 for the per-row PNG filter byte)

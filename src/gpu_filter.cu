@@ -374,17 +374,19 @@ void gpu_filter_copy_prior_row_to_host(const GpuFilterContext* ctx, uint8_t* h_d
 void gpu_filter_reset(GpuFilterContext* ctx)
 {
     if (!ctx) return;
-    // Zero the prior-row buffer so the first strip of the next frame starts
-    // with zeros for its Up/Paeth predictors (PNG spec, per-image reset).
+    // Zero the prior-row buffer so the first strip starts with zeros for its
+    // Up/Paeth predictors (PNG spec). The subsequent H2D + kernel launch for
+    // the first strip run in the same stream and will see the memset result
+    // without a host sync.
     CHECK_CUDA(cudaMemsetAsync(ctx->d_prior, 0, ctx->width_bytes, ctx->stream));
-    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
 }
 
 // ---------------------------------------------------------------------------
 // Internal: launch kernels, DMA result to pinned host, fill timings
 // ---------------------------------------------------------------------------
 static const uint8_t* run_kernels(GpuFilterContext* ctx, int actual_rows,
-                                   GpuTimings* timings, const DicomPixelParams* dicom)
+                                   GpuTimings* timings, const DicomPixelParams* dicom,
+                                   bool skip_d2h = false)
 {
     const int W = ctx->width_bytes;
 
@@ -416,15 +418,23 @@ static const uint8_t* run_kernels(GpuFilterContext* ctx, int actual_rows,
 
     CHECK_CUDA(cudaEventRecord(ctx->ev_kernels_done, ctx->stream));
 
-    const size_t out_bytes = gpu_filter_output_size(ctx, actual_rows);
-    CHECK_CUDA(cudaMemcpyAsync(
-        ctx->h_output, ctx->d_selected,
-        out_bytes,
-        cudaMemcpyDeviceToHost,
-        ctx->stream));
-
-    CHECK_CUDA(cudaEventRecord(ctx->ev_d2h_done, ctx->stream));
-    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+    if (!skip_d2h) {
+        const size_t out_bytes = gpu_filter_output_size(ctx, actual_rows);
+        CHECK_CUDA(cudaMemcpyAsync(
+            ctx->h_output, ctx->d_selected,
+            out_bytes,
+            cudaMemcpyDeviceToHost,
+            ctx->stream));
+        CHECK_CUDA(cudaEventRecord(ctx->ev_d2h_done, ctx->stream));
+        CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+    } else {
+        // Modern GPU-deflate path: d_selected is consumed directly on the
+        // device.  Record ev_d2h_done immediately so elapsed-time queries
+        // report 0 for d2h (accurate -- no transfer occurred).
+        // Synchronization is provided by the gpu_filter_copy_prior_row_to_host()
+        // call that follows in modern_filter_stage.
+        CHECK_CUDA(cudaEventRecord(ctx->ev_d2h_done, ctx->stream));
+    }
 
     if (timings) {
         cudaEventElapsedTime(&timings->h2d_ms,    ctx->ev_start,        ctx->ev_h2d_done);
@@ -460,7 +470,8 @@ const uint8_t* gpu_filter_process_from_host(
     const uint8_t*          h_prior_row,
     int                     actual_rows,
     GpuTimings*             timings,
-    const DicomPixelParams* dicom)
+    const DicomPixelParams* dicom,
+    bool                    device_output_only)
 {
     CHECK_CUDA(cudaEventRecord(ctx->ev_start, ctx->stream));
     const size_t strip_bytes = (size_t)actual_rows * ctx->width_bytes;
@@ -470,5 +481,5 @@ const uint8_t* gpu_filter_process_from_host(
         CHECK_CUDA(cudaMemcpyAsync(ctx->d_prior, h_prior_row,
                                    ctx->width_bytes, cudaMemcpyHostToDevice, ctx->stream));
     CHECK_CUDA(cudaEventRecord(ctx->ev_h2d_done, ctx->stream));
-    return run_kernels(ctx, actual_rows, timings, dicom);
+    return run_kernels(ctx, actual_rows, timings, dicom, device_output_only);
 }

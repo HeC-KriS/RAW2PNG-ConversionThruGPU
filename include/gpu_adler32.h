@@ -28,7 +28,17 @@ struct GpuAdler32Context;
 GpuAdler32Context* gpu_adler32_create(size_t max_input_bytes, size_t chunk_bytes = 65536);
 void                gpu_adler32_destroy(GpuAdler32Context* ctx);
 
-// Compute the Adler-32 of d_data[0..len), which must already be resident in
-// device memory. len must be <= max_input_bytes passed to gpu_adler32_create().
-// Blocking call (synchronizes internally before returning).
+// Blocking convenience: launch + collect in one call.
 uint32_t gpu_adler32_compute(GpuAdler32Context* ctx, const uint8_t* d_data, size_t len);
+
+// Split async form — allows overlap with other GPU work (e.g., deflate kernels
+// running in a different stream that also reads d_data).
+//
+// gpu_adler32_launch: queues the kernel and D2H into ctx->stream. Returns
+//   immediately without blocking the host. len is saved in the context.
+//
+// gpu_adler32_collect: blocks the host until ctx->stream is idle, then
+//   combines the partial results and returns the Adler-32.  Must be called
+//   exactly once after each gpu_adler32_launch call and before the next launch.
+void     gpu_adler32_launch (GpuAdler32Context* ctx, const uint8_t* d_data, size_t len);
+uint32_t gpu_adler32_collect(GpuAdler32Context* ctx);

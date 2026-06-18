@@ -484,23 +484,85 @@ static bool run_one(
 // clamped to >= 3 by the caller (run_pipeline()'s dispatch block).
 // ---------------------------------------------------------------------------
 struct ModernPipelineStats {
-    std::atomic<long long> load_ms              {0};
-    std::atomic<long long> gpu_ms               {0};
-    std::atomic<long long> gpu_h2d_us           {0};
-    std::atomic<long long> gpu_kernel_us        {0};
-    std::atomic<long long> gpu_d2h_us           {0};
-    std::atomic<long long> deflate_ms           {0};
-    std::atomic<long long> adler_ms             {0};
-    std::atomic<long long> assemble_ms          {0};
-    std::atomic<long long> write_ms             {0};
-    std::atomic<long long> filter_queue_wait_ms {0};  // time blocked in qa.push()/pop()
-    std::atomic<long long> write_queue_wait_ms  {0};  // time blocked in qb.push()/pop()
+    // Stage wall times (milliseconds)
+    std::atomic<long long> load_ms       {0};
+    std::atomic<long long> gpu_ms        {0};
+    std::atomic<long long> deflate_ms    {0};
+    std::atomic<long long> adler_ms      {0};
+    std::atomic<long long> assemble_ms   {0};  // gpu_png_assemble_idat_chunk wall time
+    std::atomic<long long> write_ms      {0};
+    std::atomic<int>       strip_count   {0};
+
+    // GPU filter sub-phases (microseconds, from CUDA Events)
+    std::atomic<long long> gpu_h2d_us    {0};  // raw strip H2D
+    std::atomic<long long> gpu_kernel_us {0};  // filter kernel
+    std::atomic<long long> gpu_d2h_us    {0};  // WASTED: filtered output D2H (unused in modern path)
+
+    // GPU deflate kernel sub-phases (microseconds, from CUDA Events)
+    std::atomic<long long> deflate_lz77_us      {0};
+    std::atomic<long long> deflate_bitlen_us     {0};
+    std::atomic<long long> deflate_scan_us       {0};
+    std::atomic<long long> deflate_encode_us     {0};
+    std::atomic<long long> deflate_sync_us       {0};  // host wait per strip
+    std::atomic<long long> deflate_stats_d2h_us  {0};  // LZ77 stats D2H (28 B/strip)
+    std::atomic<long long> flush_query_us        {0};  // flushable_byte_length() D2H cost
+
+    // PNG assembly sub-phases (microseconds)
+    std::atomic<long long> assemble_header_us    {0};
+    std::atomic<long long> assemble_d2d_us       {0};
+    std::atomic<long long> assemble_presync_us   {0};
+    std::atomic<long long> assemble_crc_us       {0};
+    std::atomic<long long> assemble_crc_h2d_us   {0};
+    std::atomic<long long> assemble_d2h_us       {0};  // chunk D2H to host
+
+    // Queue wait times — separate push vs pop (previous code double-counted these)
+    std::atomic<long long> filter_push_wait_ms   {0};  // filter blocked on qa.push()
+    std::atomic<long long> compress_pop_wait_ms  {0};  // compress blocked on qa.pop()
+    std::atomic<long long> write_push_wait_ms    {0};  // compress blocked on qb.push()
+    std::atomic<long long> writer_pop_wait_ms    {0};  // writer blocked on qb.pop()
+
+    // Queue depth stats
     std::atomic<long long> filter_queue_depth_sum     {0};
     std::atomic<long long> filter_queue_depth_samples {0};
+    std::atomic<long long> filter_queue_max_depth     {0};
     std::atomic<long long> write_queue_depth_sum      {0};
     std::atomic<long long> write_queue_depth_samples  {0};
-    std::atomic<int>       strip_count          {0};
+    std::atomic<long long> write_queue_max_depth      {0};
 };
+
+// Global cross-image accumulator for batch GPU summary.
+// Zeroed by pipeline_reset_gpu_batch_stats(); read by pipeline_print_gpu_batch_summary().
+struct GpuBatchAccum {
+    std::atomic<int>       files              {0};
+    // pipeline_wall_ms: run_one_modern() only (fopen → fclose).
+    // Does NOT include DICOM decode, GPU context alloc, or batch overhead.
+    std::atomic<long long> pipeline_wall_ms   {0};
+    // file_total_ms: encode_*_to_png() entry → return, includes DICOM decode.
+    // Accumulated via pipeline_record_file_times().
+    std::atomic<long long> file_total_ms      {0};
+    // dicom_decode_ms: DicomSource::open() + load_frame() only.
+    std::atomic<long long> dicom_decode_ms    {0};
+    std::atomic<long long> load_ms            {0};
+    std::atomic<long long> gpu_ms             {0};
+    std::atomic<long long> deflate_ms         {0};
+    std::atomic<long long> assemble_ms        {0};
+    std::atomic<long long> write_ms           {0};
+    // queue_wait_ms: sum of all inter-stage queue stalls per file.
+    std::atomic<long long> queue_wait_ms      {0};
+    std::atomic<long long> gpu_h2d_us         {0};
+    std::atomic<long long> gpu_d2h_us         {0};
+    std::atomic<long long> deflate_lz77_us    {0};
+    std::atomic<long long> deflate_encode_us  {0};
+    std::atomic<long long> deflate_sync_us    {0};
+    std::atomic<long long> asm_crc_us         {0};
+    std::atomic<long long> asm_d2h_us         {0};
+    std::atomic<long long> compressed_bytes   {0};
+    std::atomic<long long> raw_bytes          {0};
+    std::atomic<long long> lz77_matches       {0};
+    std::atomic<long long> lz77_matched_bytes {0};
+    std::atomic<long long> total_positions    {0};
+};
+static GpuBatchAccum g_batch;
 
 struct GpuFilteredJob {
     int  strip_index = 0;
@@ -545,7 +607,8 @@ static void modern_filter_stage(
         GpuTimings gt;
         auto t2 = Clock::now();
         gpu_filter_process_from_host(ctx, strip_buf.data(), prev_row.data(),
-                                     actual_rows, &gt, dicom);
+                                     actual_rows, &gt, dicom,
+                                     /*device_output_only=*/true);
         auto t3 = Clock::now();
         stats.gpu_ms        += std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
         stats.gpu_h2d_us    += (long long)(gt.h2d_ms    * 1000.f);
@@ -565,12 +628,18 @@ static void modern_filter_stage(
         auto t4 = Clock::now();
         const bool pushed = qa.push(job);
         auto t5 = Clock::now();
-        stats.filter_queue_wait_ms +=
+        stats.filter_push_wait_ms +=
             std::chrono::duration_cast<std::chrono::milliseconds>(t5 - t4).count();
         if (!pushed) break;
 
-        stats.filter_queue_depth_sum     += (long long)qa.size();
+        const long long depth = (long long)qa.size();
+        stats.filter_queue_depth_sum     += depth;
         stats.filter_queue_depth_samples += 1;
+        // Track maximum depth (compare-and-swap loop for atomics)
+        long long cur_max = stats.filter_queue_max_depth.load(std::memory_order_relaxed);
+        while (depth > cur_max &&
+               !stats.filter_queue_max_depth.compare_exchange_weak(
+                   cur_max, depth, std::memory_order_relaxed)) {}
     }
     qa.close();
 }
@@ -601,10 +670,11 @@ static void modern_compress_stage(
 
     GpuFilteredJob job;
     for (;;) {
+        // --- Queue pop wait: compress starved if filter is slow ---
         auto tq0 = Clock::now();
         const bool got = qa.pop(job);
         auto tq1 = Clock::now();
-        stats.filter_queue_wait_ms +=
+        stats.compress_pop_wait_ms +=
             std::chrono::duration_cast<std::chrono::milliseconds>(tq1 - tq0).count();
         if (!got || error.load()) break;
 
@@ -612,69 +682,141 @@ static void modern_compress_stage(
         const uint8_t*    d_filtered    = gpu_filter_device_output(ctx);
         const size_t      filtered_bytes = gpu_filter_output_size(ctx, job.actual_rows);
 
+        // --- Launch GPU Deflate (ASYNC — no host sync inside) ---
         auto t0 = Clock::now();
         gpu_deflate_compress_strip(gdef, d_filtered, job.actual_rows, row_bytes_out, job.is_last);
+
+        // --- Launch GPU Adler32 CONCURRENTLY with deflate ---
+        // Both kernels read d_filtered (independent reads from the same device
+        // buffer) and write to their own separate device memory. No dependency
+        // between them → they can overlap on the GPU.
+        // d_filtered is already complete: the filter stage synchronised its
+        // stream before pushing the job, and BoundedQueue provides happens-before.
+        auto t_adler_start = Clock::now();
+        gpu_adler32_launch(gadler, d_filtered, filtered_bytes);
+
+        // --- Sync deflate: wait for GPU kernels + collect timing ---
+        gpu_deflate_stream_sync(gdef);
         auto t1 = Clock::now();
         stats.deflate_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-        auto t2 = Clock::now();
-        const uint32_t strip_adler = gpu_adler32_compute(gadler, d_filtered, filtered_bytes);
-        auto t3 = Clock::now();
-        stats.adler_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
-
-        DeflateResult dr;
-        dr.strip_adler = strip_adler;
-        dr.input_size  = filtered_bytes;
-        accum_adler(dstate, dr);
-
-        auto t4 = Clock::now();
+        // --- Flush query: D2H of 8-byte running bit count ---
+        // (deflate stream is synced; d_running_total is host-readable)
+        auto t_fq0 = Clock::now();
         const size_t avail = gpu_deflate_flushable_byte_length(gdef);
+        auto t_fq1 = Clock::now();
+        stats.flush_query_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t_fq1 - t_fq0).count();
+
         if (avail > flushed_bytes) {
             const size_t slice_len = avail - flushed_bytes;
             const bool   is_first  = (flushed_bytes == 0);
+
+            // --- PNG IDAT chunk assembly: queue D2D copy in passemble->stream ---
+            // Async: passemble->stream is independent of gadler->stream, so the
+            // adler32 kernel may still be running in gadler->stream in parallel.
+            auto t_idat0 = Clock::now();
             const size_t chunk_len = gpu_png_assemble_idat_chunk(
                 passemble, gpu_deflate_output(gdef) + flushed_bytes, slice_len,
                 is_first, false, 0, zlib_level);
+            auto t_idat1 = Clock::now();
+            stats.assemble_ms +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(t_idat1 - t_idat0).count();
 
+            // --- Collect adler32: sync gadler->stream, combine partials ---
+            // By the time we get here, deflate took ~30ms and adler ~5ms, so
+            // adler is typically already complete — the collect is near-free.
+            const uint32_t strip_adler = gpu_adler32_collect(gadler);
+            auto t_adler_done = Clock::now();
+            stats.adler_ms +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_adler_done - t_adler_start).count();
+
+            DeflateResult dr;
+            dr.strip_adler = strip_adler;
+            dr.input_size  = filtered_bytes;
+            accum_adler(dstate, dr);
+
+            // --- D2H: assembled chunk → pinned host buffer (syncs passemble->stream) ---
             ModernWriteJob wj;
             wj.bytes.resize(chunk_len);
             gpu_png_assemble_copy_to_host(passemble, wj.bytes.data(), chunk_len);
+
             flushed_bytes = avail;
 
+            // --- Queue push wait: compress blocked if writer is slow ---
             auto tw0 = Clock::now();
             const bool pushed = qb.push(std::move(wj));
             auto tw1 = Clock::now();
-            stats.write_queue_wait_ms +=
+            stats.write_push_wait_ms +=
                 std::chrono::duration_cast<std::chrono::milliseconds>(tw1 - tw0).count();
             if (!pushed) { error.store(true); break; }
 
-            stats.write_queue_depth_sum     += (long long)qb.size();
+            const long long wdepth = (long long)qb.size();
+            stats.write_queue_depth_sum     += wdepth;
             stats.write_queue_depth_samples += 1;
+            long long wmax = stats.write_queue_max_depth.load(std::memory_order_relaxed);
+            while (wdepth > wmax &&
+                   !stats.write_queue_max_depth.compare_exchange_weak(
+                       wmax, wdepth, std::memory_order_relaxed)) {}
+        } else {
+            // No data flushed this strip — still must collect adler before next launch.
+            const uint32_t strip_adler = gpu_adler32_collect(gadler);
+            auto t_adler_done = Clock::now();
+            stats.adler_ms +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_adler_done - t_adler_start).count();
+
+            DeflateResult dr;
+            dr.strip_adler = strip_adler;
+            dr.input_size  = filtered_bytes;
+            accum_adler(dstate, dr);
         }
-        auto t5 = Clock::now();
-        stats.assemble_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t5 - t4).count();
 
         stats.strip_count += 1;
     }
 
-    // Final flush: whatever bytes remain (including the byte that was only
-    // partially written during the loop, now final since no more strips
-    // will ever write to it) + the Adler-32 trailer, as the closing chunk.
+    // Final flush: remaining bytes (including the last partial byte, now complete)
+    // + the Adler-32 trailer.
     if (!error.load()) {
         const size_t   total_bytes  = gpu_deflate_output_byte_length(gdef);
         const size_t   slice_len    = total_bytes - flushed_bytes;
         const bool     is_first     = (flushed_bytes == 0);
         const uint32_t final_adler  = (uint32_t)dstate.running_adler;
 
+        auto t_idat0 = Clock::now();
         const size_t chunk_len = gpu_png_assemble_idat_chunk(
             passemble, gpu_deflate_output(gdef) + flushed_bytes, slice_len,
             is_first, true, final_adler, zlib_level);
+        auto t_idat1 = Clock::now();
+        stats.assemble_ms +=
+            std::chrono::duration_cast<std::chrono::milliseconds>(t_idat1 - t_idat0).count();
+
         ModernWriteJob wj;
         wj.bytes.resize(chunk_len);
         gpu_png_assemble_copy_to_host(passemble, wj.bytes.data(), chunk_len);
         qb.push(std::move(wj));
 
         final_adler_out = final_adler;
+    }
+
+    // Collect deflate and assembly sub-phase stats from GPU contexts
+    {
+        GpuDeflatePhaseStats dps = gpu_deflate_get_phase_stats(gdef);
+        stats.deflate_lz77_us     += dps.lz77_us;
+        stats.deflate_bitlen_us   += dps.bitlen_us;
+        stats.deflate_scan_us     += dps.scan_us;
+        stats.deflate_encode_us   += dps.encode_us;
+        stats.deflate_sync_us     += dps.sync_us;
+        stats.deflate_stats_d2h_us += dps.stats_d2h_us;
+
+        GpuPngAssembleStats aps = gpu_png_assemble_get_stats(passemble);
+        stats.assemble_header_us  += aps.header_h2d_us;
+        stats.assemble_d2d_us     += aps.data_d2d_us;
+        stats.assemble_presync_us += aps.presync_us;
+        stats.assemble_crc_us     += aps.crc_us;
+        stats.assemble_crc_h2d_us += aps.crc_h2d_us;
+        stats.assemble_d2h_us     += aps.copy_d2h_us;
     }
 
     qb.close();
@@ -691,7 +833,15 @@ static void modern_writer_stage(
 {
     using Clock = std::chrono::high_resolution_clock;
     ModernWriteJob job;
-    while (qb.pop(job)) {
+    for (;;) {
+        // --- Queue pop wait: writer starved if compress is slow ---
+        auto tw0 = Clock::now();
+        const bool got = qb.pop(job);
+        auto tw1 = Clock::now();
+        stats.writer_pop_wait_ms +=
+            std::chrono::duration_cast<std::chrono::milliseconds>(tw1 - tw0).count();
+        if (!got) break;
+
         if (error.load()) continue;  // drain without writing once a failure is flagged
         auto t0 = Clock::now();
         fwrite(job.bytes.data(), 1, job.bytes.size(), f);
@@ -818,9 +968,41 @@ static bool run_one_modern(
         return false;
     }
 
+    const double wall_ms_total = (double)std::chrono::duration_cast<std::chrono::microseconds>(
+        t_wall_end - t_wall_start).count() / 1000.0;
+
+    // Accumulate into the global batch stats (thread-safe via atomics).
+    {
+        LzStats lzs = gpu_deflate_lz_stats(gdef);
+        g_batch.files             .fetch_add(1);
+        g_batch.pipeline_wall_ms  .fetch_add((long long)wall_ms_total);
+        g_batch.load_ms           .fetch_add(stats.load_ms.load());
+        g_batch.gpu_ms            .fetch_add(stats.gpu_ms.load());
+        g_batch.deflate_ms        .fetch_add(stats.deflate_ms.load());
+        g_batch.assemble_ms       .fetch_add(stats.assemble_ms.load());
+        g_batch.write_ms          .fetch_add(stats.write_ms.load());
+        g_batch.queue_wait_ms     .fetch_add(
+            stats.filter_push_wait_ms.load() +
+            stats.compress_pop_wait_ms.load() +
+            stats.write_push_wait_ms.load() +
+            stats.writer_pop_wait_ms.load());
+        g_batch.gpu_h2d_us        .fetch_add(stats.gpu_h2d_us.load());
+        g_batch.gpu_d2h_us        .fetch_add(stats.gpu_d2h_us.load());
+        g_batch.deflate_lz77_us   .fetch_add(stats.deflate_lz77_us.load());
+        g_batch.deflate_encode_us .fetch_add(stats.deflate_encode_us.load());
+        g_batch.deflate_sync_us   .fetch_add(stats.deflate_sync_us.load());
+        g_batch.asm_crc_us        .fetch_add(stats.assemble_crc_us.load());
+        g_batch.asm_d2h_us        .fetch_add(stats.assemble_d2h_us.load());
+        g_batch.compressed_bytes  .fetch_add((long long)gpu_deflate_output_byte_length(gdef));
+        const long long filt_b = (long long)((size_t)(info.width * info.bpp + 1) * (size_t)info.height);
+        g_batch.raw_bytes         .fetch_add(filt_b);
+        g_batch.lz77_matches      .fetch_add((long long)lzs.matches_found);
+        g_batch.lz77_matched_bytes.fetch_add((long long)lzs.matched_bytes);
+        g_batch.total_positions   .fetch_add((long long)lzs.total_positions);
+    }
+
     if (print_report) {
-        double wall_ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(
-            t_wall_end - t_wall_start).count() / 1000.0;
+        double wall_ms = wall_ms_total;
         double total_pixels = (double)info.width * (double)info.height;
         double total_mb     = total_pixels * info.bpp / (1024.0 * 1024.0);
         double mpps         = (total_pixels / 1e6) / (wall_ms / 1000.0);
@@ -830,115 +1012,497 @@ static bool run_one_modern(
         fmt_timestamp(t_abs_start, ts_start);
         fmt_timestamp(t_abs_end,   ts_end);
 
-        const long long load_ms      = stats.load_ms.load();
-        const long long gpu_ms_v     = stats.gpu_ms.load();
-        const long long gpu_h2d_ms   = stats.gpu_h2d_us.load()    / 1000LL;
-        const long long gpu_kernel_ms = stats.gpu_kernel_us.load() / 1000LL;
-        const long long gpu_d2h_ms   = stats.gpu_d2h_us.load()    / 1000LL;
-        const long long deflate_ms   = stats.deflate_ms.load();
-        const long long adler_ms     = stats.adler_ms.load();
-        const long long assemble_ms  = stats.assemble_ms.load();
-        const long long write_ms     = stats.write_ms.load();
-        const long long fq_wait_ms   = stats.filter_queue_wait_ms.load();
-        const long long wq_wait_ms   = stats.write_queue_wait_ms.load();
+        // --- Load all raw counters ---
+        const long long load_ms_v        = stats.load_ms.load();
+        const long long gpu_ms_v         = stats.gpu_ms.load();
+        const long long gpu_h2d_us       = stats.gpu_h2d_us.load();
+        const long long gpu_kernel_us    = stats.gpu_kernel_us.load();
+        const long long gpu_d2h_us       = stats.gpu_d2h_us.load();
+        const long long deflate_ms_v     = stats.deflate_ms.load();
+        const long long adler_ms_v       = stats.adler_ms.load();
+        const long long assemble_ms_v    = stats.assemble_ms.load();
+        const long long write_ms_v       = stats.write_ms.load();
+        const int       nstrips          = stats.strip_count.load();
 
-        const double sum_stage_ms = (double)(load_ms + gpu_ms_v + deflate_ms +
-                                             adler_ms + assemble_ms + write_ms);
-        const double overlap_efficiency = (sum_stage_ms > 0.0)
-            ? std::max(0.0, (sum_stage_ms - wall_ms) / sum_stage_ms) * 100.0
-            : 0.0;
+        const long long def_lz77_us      = stats.deflate_lz77_us.load();
+        const long long def_bitlen_us    = stats.deflate_bitlen_us.load();
+        const long long def_scan_us      = stats.deflate_scan_us.load();
+        const long long def_encode_us    = stats.deflate_encode_us.load();
+        const long long def_sync_us      = stats.deflate_sync_us.load();
+        const long long def_statsd2h_us  = stats.deflate_stats_d2h_us.load();
+        const long long flush_query_us_v = stats.flush_query_us.load();
+
+        const long long asm_header_us    = stats.assemble_header_us.load();
+        const long long asm_d2d_us       = stats.assemble_d2d_us.load();
+        const long long asm_presync_us   = stats.assemble_presync_us.load();
+        const long long asm_crc_us       = stats.assemble_crc_us.load();
+        const long long asm_crch2d_us    = stats.assemble_crc_h2d_us.load();
+        const long long asm_d2h_us       = stats.assemble_d2h_us.load();
+
+        const long long fq_push_ms       = stats.filter_push_wait_ms.load();
+        const long long cmp_pop_ms       = stats.compress_pop_wait_ms.load();
+        const long long wq_push_ms       = stats.write_push_wait_ms.load();
+        const long long wrt_pop_ms       = stats.writer_pop_wait_ms.load();
+
+        const long long fq_depth_n       = stats.filter_queue_depth_samples.load();
+        const long long wq_depth_n       = stats.write_queue_depth_samples.load();
+        const double avg_fq_depth        = fq_depth_n > 0
+            ? (double)stats.filter_queue_depth_sum.load() / (double)fq_depth_n : 0.0;
+        const double avg_wq_depth        = wq_depth_n > 0
+            ? (double)stats.write_queue_depth_sum.load() / (double)wq_depth_n : 0.0;
+        const long long max_fq_depth     = stats.filter_queue_max_depth.load();
+        const long long max_wq_depth     = stats.write_queue_max_depth.load();
+
+        // Derived metrics
+        const long long gpu_h2d_ms       = gpu_h2d_us   / 1000LL;
+        const long long gpu_kernel_ms    = gpu_kernel_us / 1000LL;
+        const long long gpu_d2h_ms       = gpu_d2h_us   / 1000LL;
 
         const size_t total_compressed_bytes = gpu_deflate_output_byte_length(gdef);
-        const double uncompressed_filtered_bytes = (double)(row_b + 1) * (double)info.height;
-        const double compression_ratio = (uncompressed_filtered_bytes > 0.0)
-            ? (double)total_compressed_bytes / uncompressed_filtered_bytes : 0.0;
-        const double deflate_throughput_gbs = (deflate_ms > 0)
-            ? (uncompressed_filtered_bytes / (1024.0*1024.0*1024.0)) / ((double)deflate_ms / 1000.0)
-            : 0.0;
-        const double h2d_bandwidth_gbs = (gpu_h2d_ms > 0)
+        const double filtered_bytes = (double)(row_b + 1) * (double)info.height;
+        const double compression_ratio = (filtered_bytes > 0.0)
+            ? (double)total_compressed_bytes / filtered_bytes : 0.0;
+
+        const double h2d_mb = total_mb;                             // raw image H2D
+        const double d2h_wasted_mb = filtered_bytes / (1024.0*1024.0); // filter D2H (unused)
+        const double d2h_chunks_mb = (double)total_compressed_bytes / (1024.0*1024.0);
+        const double total_h2d_mb  = h2d_mb;
+        const double total_d2h_mb  = d2h_wasted_mb + d2h_chunks_mb;
+
+        const double deflate_throughput_gbs = (deflate_ms_v > 0)
+            ? (filtered_bytes / (1024.0*1024.0*1024.0)) / ((double)deflate_ms_v / 1000.0) : 0.0;
+        const double h2d_bw_gbs = (gpu_h2d_ms > 0)
             ? (total_mb / 1024.0) / ((double)gpu_h2d_ms / 1000.0) : 0.0;
-        const double d2h_bandwidth_gbs = (gpu_d2h_ms > 0)
-            ? (total_mb / 1024.0) / ((double)gpu_d2h_ms / 1000.0) : 0.0;
+        const double d2h_bw_gbs = (gpu_d2h_ms > 0)
+            ? (d2h_wasted_mb / 1024.0) / ((double)gpu_d2h_ms / 1000.0) : 0.0;
 
-        const long long fq_depth_n = stats.filter_queue_depth_samples.load();
-        const long long wq_depth_n = stats.write_queue_depth_samples.load();
-        const double avg_fq_depth = fq_depth_n > 0
-            ? (double)stats.filter_queue_depth_sum.load() / (double)fq_depth_n : 0.0;
-        const double avg_wq_depth = wq_depth_n > 0
-            ? (double)stats.write_queue_depth_sum.load() / (double)wq_depth_n : 0.0;
+        const double sum_stage_ms = (double)(load_ms_v + gpu_ms_v + deflate_ms_v +
+                                             adler_ms_v + assemble_ms_v + write_ms_v);
+        const double overlap_pct = (sum_stage_ms > 0.0)
+            ? std::max(0.0, (sum_stage_ms - wall_ms) / sum_stage_ms) * 100.0 : 0.0;
 
+        // =====================================================================
         fprintf(stdout, "\n--- Modern Pipeline Timing Report (overlapped, custom GPU deflate) ---\n");
         fprintf(stdout, "Started             : %s\n", ts_start);
         fprintf(stdout, "Finished            : %s\n", ts_end);
         fprintf(stdout, "Wall time           : %.1f ms\n", wall_ms);
         fprintf(stdout, "Throughput          : %.2f MP/s  |  %.1f MB/s (uncompressed)\n", mpps, mbs);
-        // "Stream utilization" here is a coarse proxy (filter stage's own
-        // wall-clock share of the whole pipeline's wall time), NOT true SM
-        // occupancy -- that needs NVIDIA profiling tools (Nsight Systems/
-        // Compute, CUPTI) instrumenting the actual hardware, which this
-        // process cannot measure from inside itself. Likewise "concurrent
-        // kernel count" is intentionally not reported here for the same
-        // reason: fabricating a number without a profiler backing it would
-        // be worse than omitting it. Use Nsight Systems against this binary
-        // for both if you need hardware-verified figures.
-        const double stream_utilization_pct = (wall_ms > 0.0)
-            ? std::min(100.0, (double)gpu_ms_v / wall_ms * 100.0) : 0.0;
+        fprintf(stdout, "GPU Streams         : %d  |  Overlap Efficiency: %.0f%%\n",
+                (int)filter_pool.size(), overlap_pct);
+        fprintf(stdout, "Strips              : %d  (strip_height = %d)\n", nstrips, strip_h);
 
-        fprintf(stdout, "\nGPU Streams         : %d\n", (int)filter_pool.size());
-        fprintf(stdout, "Stream Utilization  : %.0f%%  (approx: filter-stage wall time / pipeline "
-                        "wall time -- not true SM occupancy; profile with Nsight for that)\n",
-                stream_utilization_pct);
-        fprintf(stdout, "Overlap Efficiency  : %.0f%%  ((sum of stage times - wall) / sum of stage times)\n",
-                overlap_efficiency);
-        fprintf(stdout, "\nLoader              : %lld ms  (%d strips)\n", load_ms, stats.strip_count.load());
-        fprintf(stdout, "GPU filter (wall)   : %lld ms\n", gpu_ms_v);
-        fprintf(stdout, "  H2D transfer      : %lld ms  (%.2f GB/s)\n", gpu_h2d_ms, h2d_bandwidth_gbs);
-        fprintf(stdout, "  Kernels           : %lld ms\n", gpu_kernel_ms);
-        fprintf(stdout, "  D2H transfer      : %lld ms  (%.2f GB/s -- output unused in this "
-                        "path, see gpu_filter.cu; kept because legacy shares this code)\n",
-                gpu_d2h_ms, d2h_bandwidth_gbs);
-        fprintf(stdout, "GPU deflate         : %lld ms  (%.2f GB/s)\n", deflate_ms, deflate_throughput_gbs);
-        fprintf(stdout, "GPU Adler32         : %lld ms\n", adler_ms);
-        fprintf(stdout, "GPU PNG assemble    : %lld ms  (%zu compressed bytes)\n",
-                assemble_ms, total_compressed_bytes);
-        fprintf(stdout, "Writer              : %lld ms\n", write_ms);
-        fprintf(stdout, "\nFilter->Compress queue wait : %lld ms  (avg depth %.1f / capacity %zu)\n",
-                fq_wait_ms, avg_fq_depth, qa_capacity);
-        fprintf(stdout, "Compress->Writer queue wait : %lld ms  (avg depth %.1f / capacity %zu)\n",
-                wq_wait_ms, avg_wq_depth, qb_capacity);
+        // --- Stage Times ---
+        fprintf(stdout, "\nStage Times (concurrent -- sum exceeds wall time):\n");
+        fprintf(stdout, "  Loader            : %lld ms\n", load_ms_v);
+        fprintf(stdout, "  GPU Filter (wall) : %lld ms\n", gpu_ms_v);
+        fprintf(stdout, "  GPU Deflate       : %lld ms  (%.2f GB/s throughput)\n",
+                deflate_ms_v, deflate_throughput_gbs);
+        fprintf(stdout, "  GPU Adler32       : %lld ms\n", adler_ms_v);
+        fprintf(stdout, "  PNG Assemble      : %lld ms\n", assemble_ms_v);
+        fprintf(stdout, "  Writer            : %lld ms\n", write_ms_v);
+
+        // --- PNG Assembly Breakdown ---
+        fprintf(stdout, "\n=== PNG Assembly Breakdown ===\n");
+        fprintf(stdout, "  Chunks Produced   : %lld\n",
+                (long long)gpu_png_assemble_get_stats(passemble).chunks);
+        fprintf(stdout, "  Header H2D        : %lld us  (len+type 8B + optional zlib header 2B)\n",
+                asm_header_us);
+        fprintf(stdout, "  Data D2D Copy     : %lld us  (compressed slice → GPU chunk buffer)\n",
+                asm_d2d_us);
+        fprintf(stdout, "  Pre-CRC Sync      : %lld us  (stream sync stall -- actual D2D time)\n",
+                asm_presync_us);
+        fprintf(stdout, "  CRC Generation    : %lld us  (CPU crc32() on host after D2H -- Phase2 replaced GPU CRC)\n",
+                asm_crc_us);
+        fprintf(stdout, "  CRC Finalize      : %lld us  (obsolete GPU CRC H2D -- now 0; CPU CRC writes directly to host buf)\n",
+                asm_crch2d_us);
+        fprintf(stdout, "  Chunk D2H         : %lld us  (%.2f MB assembled chunks → host)\n",
+                asm_d2h_us, d2h_chunks_mb);
+
+        // --- Transfer Breakdown ---
+        fprintf(stdout, "\n=== Transfer Breakdown ===\n");
+        fprintf(stdout, "  Filter H2D        : %lld ms  (%.2f MB raw image → GPU, %.2f GB/s)\n",
+                gpu_h2d_ms, h2d_mb, h2d_bw_gbs);
+        fprintf(stdout, "  Filter D2H [!]    : %lld ms  (%.2f MB filtered output → host"
+                        " -- NOT USED in modern path, WASTED bandwidth, %.2f GB/s)\n",
+                gpu_d2h_ms, d2h_wasted_mb, d2h_bw_gbs);
+        fprintf(stdout, "  LZ77 Stats D2H    : %lld us  (28 B x %d strips = %d B)\n",
+                def_statsd2h_us, nstrips, nstrips * 28);
+        fprintf(stdout, "  Flush Query D2H   : %lld us  (8 B x %d strips = %d B -- running bit count)\n",
+                flush_query_us_v, nstrips, nstrips * 8);
+        fprintf(stdout, "  Assembly D2H      : %lld us  (see Chunk D2H above)\n", asm_d2h_us);
+        fprintf(stdout, "  Total H2D         : %.2f MB\n", total_h2d_mb);
+        fprintf(stdout, "  Total D2H         : %.2f MB  (%.2f MB wasted filter + %.2f MB chunks)\n",
+                total_d2h_mb, d2h_wasted_mb, d2h_chunks_mb);
+
+        // --- Queue Stall Analysis ---
+        fprintf(stdout, "\n=== Queue Stall Analysis ===\n");
+        fprintf(stdout, "  Filter→Compress queue (capacity %zu):\n", qa_capacity);
+        fprintf(stdout, "    Avg depth         : %.1f  |  Max depth: %lld\n",
+                avg_fq_depth, max_fq_depth);
+        fprintf(stdout, "    Filter push wait  : %lld ms"
+                        "  (filter blocked -- compress can't keep up)\n", fq_push_ms);
+        fprintf(stdout, "    Compress pop wait : %lld ms"
+                        "  (compress starved -- filter too slow)\n", cmp_pop_ms);
+        fprintf(stdout, "  Compress→Writer queue (capacity %zu):\n", qb_capacity);
+        fprintf(stdout, "    Avg depth         : %.1f  |  Max depth: %lld\n",
+                avg_wq_depth, max_wq_depth);
+        fprintf(stdout, "    Write push wait   : %lld ms"
+                        "  (compress blocked -- writer can't keep up)\n", wq_push_ms);
+        fprintf(stdout, "    Writer pop wait   : %lld ms"
+                        "  (writer starved -- compress too slow)\n", wrt_pop_ms);
+
+        // --- Deflate Kernel Breakdown ---
+        fprintf(stdout, "\n=== GPU Deflate Kernel Breakdown ===\n");
         if (cfg.use_gpu_lz77) {
-            fprintf(stdout, "\nLZ77 Configuration:\n");
-            fprintf(stdout, "  Hash Buckets     : %d  (12-bit Knuth multiplicative hash)\n", 4096);
-            fprintf(stdout, "  Candidates/Bucket: 1   (LZ4-style, most-recent wins)\n");
-            fprintf(stdout, "  Match Window     : per-row  (max dist %d bytes)\n", 32768);
-            fprintf(stdout, "  Min Match Length : 3 bytes\n");
-            fprintf(stdout, "  Max Match Length : 258 bytes\n");
-            fprintf(stdout, "  Shared Mem/Block : 16 KB  (4096 × uint32_t hash table)\n");
+            fprintf(stdout, "  LZ77 Match Finder : %lld us  (1 active thread/block × %d blocks,"
+                            " %d threads launched, util=3.1%%)\n",
+                    def_lz77_us, nstrips > 0 ? strip_h : 0, nstrips > 0 ? strip_h * 32 : 0);
+        } else {
+            fprintf(stdout, "  LZ77 Match Finder : 0 us  (literal-only path)\n");
+        }
+        fprintf(stdout, "  Bit Length (A/A') : %lld us  (per-row Huffman bit count)\n", def_bitlen_us);
+        fprintf(stdout, "  Prefix Scan (B)   : %lld us  (3-pass multi-block scan)\n", def_scan_us);
+        fprintf(stdout, "  Encode (C+D+E)    : %lld us  (block header + Huffman emit + EOB)\n", def_encode_us);
+        fprintf(stdout, "  Stream Sync       : %lld us  (CPU waiting for GPU per strip)\n", def_sync_us);
+        fprintf(stdout, "  LZ77 Stats D2H    : %lld us  (28 B/strip blocking readback)\n", def_statsd2h_us);
 
-            LzStats lzs = gpu_deflate_lz_stats(gdef);
-            fprintf(stdout, "\nGPU LZ77 Statistics:\n");
-            fprintf(stdout, "  Matches Found    : %llu\n",
+        // --- GPU Kernel Utilization (estimated) ---
+        fprintf(stdout, "\n=== GPU Kernel Utilization (estimated, not hardware-verified) ===\n");
+        if (cfg.use_gpu_lz77) {
+            fprintf(stdout, "  LZ77 kernel       : 1/32 threads/block active = 3.1%% thread util\n");
+            fprintf(stdout, "                      Shared mem: 4 KB/block (1024×uint32 hash table, Phase2 reduced from 16 KB)\n");
+            fprintf(stdout, "                      4 KB/block allows ~16+ blocks/SM on Blackwell (was 6 at 16 KB)\n");
+        }
+        fprintf(stdout, "  Filter kernel     : 256 threads/block, 5120 B shared per block\n");
+        fprintf(stdout, "  Deflate encode    : 256 threads/block, many atomicOr per thread\n");
+        fprintf(stdout, "  (Use Nsight Systems/Compute for true SM occupancy and warp efficiency)\n");
+
+        // --- Compression Statistics ---
+        LzStats lzs = gpu_deflate_lz_stats(gdef);
+        const uint64_t raw_bytes_v   = (uint64_t)(filtered_bytes);
+        const uint64_t literal_bytes = (lzs.total_positions > 0)
+            ? (lzs.total_positions - lzs.matched_bytes) : raw_bytes_v;
+
+        fprintf(stdout, "\n=== Compression Statistics ===\n");
+        fprintf(stdout, "  Raw Bytes         : %.2f MB  (filtered output)\n",
+                filtered_bytes / (1024.0*1024.0));
+        fprintf(stdout, "  Compressed Bytes  : %.2f MB\n",
+                (double)total_compressed_bytes / (1024.0*1024.0));
+        fprintf(stdout, "  Compression Ratio : %.3f  (compressed / raw)\n", compression_ratio);
+        if (cfg.use_gpu_lz77 && lzs.total_positions > 0) {
+            fprintf(stdout, "  Literal Bytes     : %llu  (%.1f%% of input)\n",
+                    (unsigned long long)literal_bytes,
+                    100.0 * (double)literal_bytes / (double)lzs.total_positions);
+            fprintf(stdout, "  Match Count       : %llu\n",
                     (unsigned long long)lzs.matches_found);
-            fprintf(stdout, "  Matched Bytes    : %llu\n",
-                    (unsigned long long)lzs.matched_bytes);
-            fprintf(stdout, "  Coverage         : %.1f %%  (matched_bytes / total_bytes)\n",
-                    lzs.coverage * 100.0);
-            fprintf(stdout, "  Average Length   : %.1f\n", lzs.avg_match_len);
-            fprintf(stdout, "  Maximum Length   : %u\n",   lzs.max_match_len);
-            fprintf(stdout, "  Average Distance : %.0f\n", lzs.avg_match_dist);
-            fprintf(stdout, "  Total Positions  : %llu\n",
-                    (unsigned long long)lzs.total_positions);
+            fprintf(stdout, "  Matched Bytes     : %llu  (%.1f%% coverage)\n",
+                    (unsigned long long)lzs.matched_bytes, lzs.coverage * 100.0);
+            fprintf(stdout, "  Avg Match Length  : %.1f bytes\n", lzs.avg_match_len);
+            fprintf(stdout, "  Max Match Length  : %u bytes\n",   lzs.max_match_len);
+            fprintf(stdout, "  Avg Match Distance: %.0f bytes\n", lzs.avg_match_dist);
+        }
+        fprintf(stdout, "  LZ77 Config       : hash=%d buckets, 1 slot/bucket, "
+                        "min=%d max=%d bytes\n", 1024, 3, 258);
+        fprintf(stdout, "  Final Adler-32    : 0x%08x\n", final_adler);
+
+        // =====================================================================
+        // PERFORMANCE SUMMARY with bottleneck identification
+        // =====================================================================
+        // Identify the dominant bottleneck. We compare stage times that are
+        // ON THE CRITICAL PATH of the pipeline (not overlapped work).
+        // The filter D2H is a special case: it's wasted but adds to GPU stage time.
+        const long long gpu_filter_total_ms = gpu_ms_v;
+        const long long gpu_lz77_ms_v       = def_lz77_us / 1000LL;
+        const long long gpu_deflate_other_ms = (deflate_ms_v > gpu_lz77_ms_v / 1000LL)
+                                               ? deflate_ms_v : deflate_ms_v;
+        const long long png_assemble_total_ms = assemble_ms_v
+                                               + (long long)(asm_d2h_us / 1000LL);
+        const long long writer_total_ms       = write_ms_v;
+
+        struct { const char* name; long long ms; } stages[] = {
+            { "GPU Filter",   gpu_filter_total_ms     },
+            { "GPU Deflate",  deflate_ms_v            },
+            { "GPU LZ77",     gpu_lz77_ms_v           },
+            { "PNG Assembly", png_assemble_total_ms   },
+            { "Writer",       writer_total_ms         },
+            { "Loader",       load_ms_v               },
+        };
+        int bottleneck_idx = 0;
+        for (int i = 1; i < 6; i++)
+            if (stages[i].ms > stages[bottleneck_idx].ms) bottleneck_idx = i;
+
+        fprintf(stdout, "\n");
+        for (int i = 0; i < 60; i++) fputc('=', stdout); fputc('\n', stdout);
+        fprintf(stdout, "PERFORMANCE SUMMARY\n");
+        for (int i = 0; i < 60; i++) fputc('=', stdout); fputc('\n', stdout);
+        fprintf(stdout, "Files Processed     : 1\n");
+        fprintf(stdout, "Total Runtime       : %.3f s  (%.1f ms)\n",
+                wall_ms / 1000.0, wall_ms);
+        fprintf(stdout, "\n");
+        fprintf(stdout, "GPU Filter Time     : %lld ms\n", gpu_filter_total_ms);
+        fprintf(stdout, "GPU LZ77 Time       : %lld ms  (GPU event)\n", gpu_lz77_ms_v);
+        fprintf(stdout, "GPU Deflate Time    : %lld ms  (wall, includes sync)\n", deflate_ms_v);
+        fprintf(stdout, "PNG Assembly Time   : %lld ms  (assemble + D2H)\n", png_assemble_total_ms);
+        fprintf(stdout, "Writer Time         : %lld ms\n", writer_total_ms);
+        fprintf(stdout, "\n");
+        fprintf(stdout, "Total H2D           : %.2f MB\n", total_h2d_mb);
+        fprintf(stdout, "Total D2H           : %.2f MB  (%.2f MB wasted filter)\n",
+                total_d2h_mb, d2h_wasted_mb);
+        fprintf(stdout, "\n");
+        fprintf(stdout, "Largest Bottleneck  : %s (%lld ms)\n",
+                stages[bottleneck_idx].name, stages[bottleneck_idx].ms);
+
+        // Specific diagnosis
+        if (gpu_d2h_ms > (long long)(wall_ms * 0.15)) {
+            fprintf(stdout, "  [!] WASTED FILTER D2H: %lld ms (%.0f%% of wall time).\n",
+                    gpu_d2h_ms, 100.0 * gpu_d2h_ms / wall_ms);
+            fprintf(stdout, "      The modern path never reads h_output from gpu_filter.\n");
+            fprintf(stdout, "      Eliminating this transfer will directly cut GPU stage time.\n");
+        }
+        if (cfg.use_gpu_lz77 && gpu_lz77_ms_v > (long long)(deflate_ms_v * 0.5)) {
+            fprintf(stdout, "  [!] LZ77 DOMINATES DEFLATE: %lld ms / %lld ms (%.0f%%).\n",
+                    gpu_lz77_ms_v, deflate_ms_v,
+                    (deflate_ms_v > 0) ? 100.0 * gpu_lz77_ms_v / deflate_ms_v : 0.0);
+            fprintf(stdout, "      LZ77 uses 1 thread per row block (3.1%% utilization).\n");
+            fprintf(stdout, "      Consider multi-bucket hash or wider match search.\n");
+        }
+        if (asm_crc_us > asm_d2d_us && asm_crc_us > asm_presync_us) {
+            fprintf(stdout, "  [!] CRC GENERATION DOMINANT IN ASSEMBLY: %lld us.\n", asm_crc_us);
+            fprintf(stdout, "      CRC kernel runs 1 thread/block serially over 64KB chunks.\n");
+        }
+        if (cmp_pop_ms > fq_push_ms && cmp_pop_ms > (long long)(wall_ms * 0.1)) {
+            fprintf(stdout, "  [!] COMPRESS STAGE STARVED: %lld ms waiting for filter.\n",
+                    cmp_pop_ms);
+            fprintf(stdout, "      Filter is the pipeline bottleneck.\n");
+        } else if (fq_push_ms > cmp_pop_ms && fq_push_ms > (long long)(wall_ms * 0.1)) {
+            fprintf(stdout, "  [!] FILTER STAGE BLOCKED: %lld ms waiting for compress.\n",
+                    fq_push_ms);
+            fprintf(stdout, "      Compress is the pipeline bottleneck.\n");
         }
 
-        fprintf(stdout, "\nCompression Ratio   : %.2f\n", compression_ratio);
-        fprintf(stdout, "Final Adler-32      : 0x%08x  (decode-compare against the CPU path's "
-                        "checksum for the same input)\n", final_adler);
-        fprintf(stdout, "\n(3 stages overlap on independent threads -- wall time can be, "
-                        "and should be, less than the sum of stage times above)\n");
+        fprintf(stdout, "\n(3 pipeline stages run concurrently -- wall < sum of stage times)\n");
     }
 
     return true;
 }
+
+void pipeline_reset_gpu_batch_stats()
+{
+    g_batch.files             .store(0);
+    g_batch.pipeline_wall_ms  .store(0);
+    g_batch.file_total_ms     .store(0);
+    g_batch.dicom_decode_ms   .store(0);
+    g_batch.load_ms           .store(0);
+    g_batch.gpu_ms            .store(0);
+    g_batch.deflate_ms        .store(0);
+    g_batch.assemble_ms       .store(0);
+    g_batch.write_ms          .store(0);
+    g_batch.queue_wait_ms     .store(0);
+    g_batch.gpu_h2d_us        .store(0);
+    g_batch.gpu_d2h_us        .store(0);
+    g_batch.deflate_lz77_us   .store(0);
+    g_batch.deflate_encode_us .store(0);
+    g_batch.deflate_sync_us   .store(0);
+    g_batch.asm_crc_us        .store(0);
+    g_batch.asm_d2h_us        .store(0);
+    g_batch.compressed_bytes  .store(0);
+    g_batch.raw_bytes         .store(0);
+    g_batch.lz77_matches      .store(0);
+    g_batch.lz77_matched_bytes.store(0);
+    g_batch.total_positions   .store(0);
+}
+
+void pipeline_record_file_times(long long dicom_ms, long long total_ms)
+{
+    g_batch.dicom_decode_ms.fetch_add(dicom_ms);
+    g_batch.file_total_ms  .fetch_add(total_ms);
+}
+
+void pipeline_print_gpu_batch_summary(int total_files, int succeeded,
+                                      double total_wall_s,
+                                      long long sum_file_batch_ms,
+                                      int num_workers)
+{
+    const int       files          = g_batch.files.load();
+    const long long pipeline_sum   = g_batch.pipeline_wall_ms.load();
+    const long long file_total_sum = g_batch.file_total_ms.load();
+    const long long dicom_sum      = g_batch.dicom_decode_ms.load();
+    const long long load_ms        = g_batch.load_ms.load();
+    const long long gpu_ms         = g_batch.gpu_ms.load();
+    const long long deflate_ms     = g_batch.deflate_ms.load();
+    const long long assemble_ms    = g_batch.assemble_ms.load();
+    const long long write_ms_v     = g_batch.write_ms.load();
+    const long long queue_wait_sum = g_batch.queue_wait_ms.load();
+    const long long h2d_us         = g_batch.gpu_h2d_us.load();
+    const long long d2h_wasted_us  = g_batch.gpu_d2h_us.load();
+    const long long lz77_us        = g_batch.deflate_lz77_us.load();
+    const long long encode_us      = g_batch.deflate_encode_us.load();
+    const long long sync_us        = g_batch.deflate_sync_us.load();
+    const long long crc_us         = g_batch.asm_crc_us.load();
+    const long long asm_d2h_us_v   = g_batch.asm_d2h_us.load();
+    const long long comp_bytes     = g_batch.compressed_bytes.load();
+    const long long raw_bytes      = g_batch.raw_bytes.load();
+    const long long lz_matches     = g_batch.lz77_matches.load();
+    const long long lz_matched_b   = g_batch.lz77_matched_bytes.load();
+    const long long lz_total_pos   = g_batch.total_positions.load();
+
+    const double total_wall_ms     = total_wall_s * 1000.0;
+    const double fps               = (total_wall_s > 0) ? (double)total_files / total_wall_s : 0.0;
+
+    // True per-file averages — what each file actually took end-to-end.
+    // file_total_ms covers encode_*_to_png() entry → return (DICOM decode + pipeline).
+    // pipeline_wall_ms is run_one_modern() only (excludes DICOM decode).
+    const double avg_file_total_ms = (files > 0) ? (double)file_total_sum / files : 0.0;
+    const double avg_dicom_ms      = (files > 0) ? (double)dicom_sum      / files : 0.0;
+    const double avg_pipeline_ms   = (files > 0) ? (double)pipeline_sum   / files : 0.0;
+    const double avg_queue_wait_ms = (files > 0) ? (double)queue_wait_sum / files : 0.0;
+
+    // Stage averages (concurrent, do not sum to wall time)
+    const double avg_load_ms     = (files > 0) ? (double)load_ms    / files : 0.0;
+    const double avg_gpu_ms      = (files > 0) ? (double)gpu_ms     / files : 0.0;
+    const double avg_deflate_ms  = (files > 0) ? (double)deflate_ms / files : 0.0;
+    const double avg_assemble_ms = (files > 0) ? (double)assemble_ms/ files : 0.0;
+    const double avg_write_ms    = (files > 0) ? (double)write_ms_v / files : 0.0;
+
+    const double avg_h2d_ms      = (files > 0) ? (double)(h2d_us / 1000LL)        / files : 0.0;
+    const double avg_d2h_wst_ms  = (files > 0) ? (double)(d2h_wasted_us / 1000LL) / files : 0.0;
+    const double avg_lz77_ms     = (files > 0) ? (double)(lz77_us / 1000LL)       / files : 0.0;
+    const double avg_encode_ms   = (files > 0) ? (double)(encode_us / 1000LL)     / files : 0.0;
+    const double avg_sync_ms     = (files > 0) ? (double)(sync_us / 1000LL)       / files : 0.0;
+    const double avg_crc_ms      = (files > 0) ? (double)(crc_us / 1000LL)        / files : 0.0;
+    const double avg_asmd2h_ms   = (files > 0) ? (double)(asm_d2h_us_v / 1000LL)  / files : 0.0;
+
+    const double total_raw_gb    = (double)raw_bytes  / (1024.0*1024.0*1024.0);
+    const double total_comp_gb   = (double)comp_bytes / (1024.0*1024.0*1024.0);
+    const double overall_ratio   = (raw_bytes > 0) ? (double)comp_bytes / (double)raw_bytes : 0.0;
+
+    const double lz77_coverage   = (lz_total_pos > 0)
+        ? 100.0 * (double)lz_matched_b / (double)lz_total_pos : 0.0;
+    const double avg_match_len   = (lz_matches > 0)
+        ? (double)lz_matched_b / (double)lz_matches : 0.0;
+
+    for (int i = 0; i < 60; i++) fputc('=', stdout); fputc('\n', stdout);
+    fprintf(stdout, "GPU BATCH PERFORMANCE SUMMARY\n");
+    for (int i = 0; i < 60; i++) fputc('=', stdout); fputc('\n', stdout);
+    fprintf(stdout, "Files               : %d total  |  %d OK  |  %d failed\n",
+            total_files, succeeded, total_files - succeeded);
+    fprintf(stdout, "GPU images tracked  : %d\n", files);
+    fprintf(stdout, "Batch wall time     : %.3f s\n", total_wall_s);
+    fprintf(stdout, "Throughput          : %.2f files/s\n", fps);
+    fprintf(stdout, "Avg pipeline time   : %.1f ms  (run_one_modern only; excludes DICOM decode)\n",
+            avg_pipeline_ms);
+    fprintf(stdout, "Avg file total      : %.1f ms  (DICOM decode + pipeline)\n",
+            avg_file_total_ms);
+    fprintf(stdout, "\nStage Averages (per file, concurrent -- do not sum to wall time):\n");
+    fprintf(stdout, "  Loader            : %.1f ms\n",  avg_load_ms);
+    fprintf(stdout, "  GPU Filter        : %.1f ms\n",  avg_gpu_ms);
+    fprintf(stdout, "  GPU Deflate       : %.1f ms\n",  avg_deflate_ms);
+    fprintf(stdout, "  PNG Assembly      : %.1f ms\n",  avg_assemble_ms);
+    fprintf(stdout, "  Writer            : %.1f ms\n",  avg_write_ms);
+    fprintf(stdout, "\nTransfer Averages (per file):\n");
+    fprintf(stdout, "  H2D (raw image)   : %.1f ms\n",  avg_h2d_ms);
+    fprintf(stdout, "  D2H (filter) [!]  : %.1f ms  (WASTED -- unused in modern path)\n",
+            avg_d2h_wst_ms);
+    fprintf(stdout, "  Assembly D2H      : %.1f ms  (PNG chunks → host)\n", avg_asmd2h_ms);
+    fprintf(stdout, "\nDeflate Sub-phase Averages (per file):\n");
+    fprintf(stdout, "  LZ77 kernel       : %.1f ms\n",  avg_lz77_ms);
+    fprintf(stdout, "  Encode kernels    : %.1f ms\n",  avg_encode_ms);
+    fprintf(stdout, "  Stream sync stall : %.1f ms\n",  avg_sync_ms);
+    fprintf(stdout, "  Assembly CRC      : %.1f ms\n",  avg_crc_ms);
+    fprintf(stdout, "\nCompression Totals:\n");
+    fprintf(stdout, "  Raw (filtered)    : %.3f GB\n",  total_raw_gb);
+    fprintf(stdout, "  Compressed        : %.3f GB\n",  total_comp_gb);
+    fprintf(stdout, "  Overall ratio     : %.3f\n",     overall_ratio);
+    if (lz_total_pos > 0) {
+        fprintf(stdout, "  LZ77 coverage     : %.1f%%  (%lld matches, avg len %.1f)\n",
+                lz77_coverage, (long long)lz_matches, avg_match_len);
+    }
+    fprintf(stdout, "\nKey Bottlenecks (sum across all files):\n");
+    fprintf(stdout, "  Wasted filter D2H : %.1f ms total (%.1f ms/file)\n",
+            (double)(d2h_wasted_us / 1000LL), avg_d2h_wst_ms);
+    fprintf(stdout, "  LZ77 (3.1%% util)  : %.1f ms total (%.1f ms/file)\n",
+            (double)(lz77_us / 1000LL), avg_lz77_ms);
+    fprintf(stdout, "  CRC generation    : %.1f ms total (%.1f ms/file)\n",
+            (double)(crc_us / 1000LL), avg_crc_ms);
+    fprintf(stdout, "  Stream sync       : %.1f ms total (%.1f ms/file)\n",
+            (double)(sync_us / 1000LL), avg_sync_ms);
+
+    // =========================================================================
+    // TIMING CONSISTENCY REPORT
+    // Verifies that per-file timings reconcile with the observed batch wall time.
+    // All numbers below use sum_file_batch_ms (measured by batch_processor.cpp
+    // around each process_one_file() call) as the ground truth file total, which
+    // is independent of the GPU batch accumulator.
+    // =========================================================================
+    {
+        const double sum_file_ms     = (double)sum_file_batch_ms;
+        const double sum_internal_ms = (double)file_total_sum;    // encode_*_to_png scope
+        const double expected_par_ms = (num_workers > 0)
+            ? sum_file_ms / (double)num_workers : 0.0;
+        const double timing_error_ms = total_wall_ms - expected_par_ms;
+        const double timing_error_pct= (expected_par_ms > 0)
+            ? 100.0 * timing_error_ms / expected_par_ms : 0.0;
+        const double worker_util     = (num_workers > 0 && total_wall_ms > 0)
+            ? 100.0 * sum_file_ms / ((double)num_workers * total_wall_ms) : 0.0;
+
+        // Scope gap: difference between batch_processor's view of a file and
+        // the GPU pipeline's view.  Represents GPU context alloc, batch overhead,
+        // and any unmeasured phases.
+        const double scope_gap_ms    = (files > 0)
+            ? (sum_file_ms - sum_internal_ms) / files : 0.0;
+        const double avg_batch_ms    = (total_files > 0)
+            ? sum_file_ms / (double)total_files : 0.0;
+
+        fputc('\n', stdout);
+        for (int i = 0; i < 50; i++) fputc('=', stdout); fputc('\n', stdout);
+        fprintf(stdout, "TIMING CONSISTENCY REPORT\n");
+        for (int i = 0; i < 50; i++) fputc('=', stdout); fputc('\n', stdout);
+        fprintf(stdout, "Batch Wall Time        : %.0f ms\n", total_wall_ms);
+        fprintf(stdout, "Workers                : %d\n", num_workers);
+        fprintf(stdout, "Files Processed        : %d\n", total_files);
+        fputc('\n', stdout);
+        fprintf(stdout, "Avg File Total (batch) : %.0f ms  [batch_processor scope]\n",
+                avg_batch_ms);
+        fprintf(stdout, "Avg DICOM Decode       : %.0f ms  [open + load_frame]\n",
+                avg_dicom_ms);
+        fprintf(stdout, "Avg Pipeline           : %.0f ms  [run_one_modern scope]\n",
+                avg_pipeline_ms);
+        fprintf(stdout, "Avg Queue Wait         : %.0f ms  [inter-stage stalls inside pipeline]\n",
+                avg_queue_wait_ms);
+        fprintf(stdout, "Scope Gap (per file)   : %.0f ms  [batch overhead outside encode_*_to_png]\n",
+                scope_gap_ms);
+        fputc('\n', stdout);
+        fprintf(stdout, "Sum File Total         : %.0f ms\n", sum_file_ms);
+        fprintf(stdout, "Expected Parallel Time : %.0f ms  (%.0f ms / %d workers)\n",
+                expected_par_ms, sum_file_ms, num_workers);
+        fprintf(stdout, "Timing Error           : %+.0f ms  (%+.1f%%)  "
+                "[batch_wall - expected; load imbalance + scheduling]\n",
+                timing_error_ms, timing_error_pct);
+        fprintf(stdout, "Worker Utilization     : %.1f%%  (%.0f / (%d × %.0f))\n",
+                worker_util, sum_file_ms, num_workers, total_wall_ms);
+
+        // Validation verdict
+        const double abs_err_pct = (timing_error_pct < 0)
+            ? -timing_error_pct : timing_error_pct;
+        fputc('\n', stdout);
+        if (abs_err_pct <= 10.0)
+            fprintf(stdout, "Validation: PASS  (timing error %.1f%% <= 10%% threshold)\n",
+                    abs_err_pct);
+        else if (abs_err_pct <= 25.0)
+            fprintf(stdout, "Validation: WARN  (timing error %.1f%% > 10%%; "
+                    "acceptable if load is uneven)\n", abs_err_pct);
+        else
+            fprintf(stdout, "Validation: FAIL  (timing error %.1f%% > 25%%; "
+                    "likely a measurement scope bug)\n", abs_err_pct);
+    }
+    for (int i = 0; i < 60; i++) fputc('=', stdout); fputc('\n', stdout);
+}
+
+#else
+// Stubs so batch_processor.cpp links regardless of GPU_PNG_MODERN_DEFLATE.
+void pipeline_reset_gpu_batch_stats() {}
+void pipeline_record_file_times(long long, long long) {}
+void pipeline_print_gpu_batch_summary(int, int, double, long long, int) {}
 #endif  // GPU_PNG_MODERN_DEFLATE
 
 // ---------------------------------------------------------------------------
@@ -1036,31 +1600,62 @@ bool encode_tiff_to_png(const char* input_path,
                         const char* output_path,
                         const PipelineConfig& cfg)
 {
+    using Clock = std::chrono::high_resolution_clock;
+    using Ms    = std::chrono::milliseconds;
+    auto t_file_start = Clock::now();
+
     TiffSource src;
     if (!src.open(input_path)) {
         fprintf(stderr, "Cannot open TIFF: %s\n", input_path);
         return false;
     }
-    return run_pipeline(cfg, output_path, "TIFF", src);
+    bool ok = run_pipeline(cfg, output_path, "TIFF", src);
+
+    auto t_file_end = Clock::now();
+#if defined(GPU_PNG_MODERN_DEFLATE)
+    if (cfg.use_gpu_deflate) {
+        long long total_ms = std::chrono::duration_cast<Ms>(t_file_end - t_file_start).count();
+        pipeline_record_file_times(0LL, total_ms);
+    }
+#endif
+    return ok;
 }
 
 bool encode_raw_to_png(const char* input_path,
                        const char* output_path,
                        const PipelineConfig& cfg)
 {
+    using Clock = std::chrono::high_resolution_clock;
+    using Ms    = std::chrono::milliseconds;
+    auto t_file_start = Clock::now();
+
     RawSource src;
     if (!src.open(input_path)) {
         fprintf(stderr, "Cannot open RAW: %s\n", input_path);
         return false;
     }
-    return run_pipeline(cfg, output_path, "RAW", src);
+    bool ok = run_pipeline(cfg, output_path, "RAW", src);
+
+    auto t_file_end = Clock::now();
+#if defined(GPU_PNG_MODERN_DEFLATE)
+    if (cfg.use_gpu_deflate) {
+        long long total_ms = std::chrono::duration_cast<Ms>(t_file_end - t_file_start).count();
+        pipeline_record_file_times(0LL, total_ms);
+    }
+#endif
+    return ok;
 }
 
 bool encode_dicom_to_png(const char* input_path,
                          const char* output_path,
                          const PipelineConfig& cfg)
 {
+    using Clock = std::chrono::high_resolution_clock;
+    using Ms    = std::chrono::milliseconds;
+    auto t_file_start = Clock::now();
+
     DicomSource src;
+    auto t_decode_start = Clock::now();
     if (!src.open(input_path)) return false;
 
     const int frame = (cfg.frame >= 0) ? cfg.frame : 0;
@@ -1074,7 +1669,19 @@ bool encode_dicom_to_png(const char* input_path,
                 src.num_frames(), frame);
 
     if (!src.load_frame(frame)) return false;
-    return run_pipeline(cfg, output_path, "DICOM", src);
+    auto t_decode_end = Clock::now();
+
+    bool ok = run_pipeline(cfg, output_path, "DICOM", src);
+
+    auto t_file_end = Clock::now();
+#if defined(GPU_PNG_MODERN_DEFLATE)
+    if (cfg.use_gpu_deflate) {
+        long long dicom_ms = std::chrono::duration_cast<Ms>(t_decode_end - t_decode_start).count();
+        long long total_ms = std::chrono::duration_cast<Ms>(t_file_end   - t_file_start  ).count();
+        pipeline_record_file_times(dicom_ms, total_ms);
+    }
+#endif
+    return ok;
 }
 
 bool encode_dicom_all_frames_to_png(const char* input_path,

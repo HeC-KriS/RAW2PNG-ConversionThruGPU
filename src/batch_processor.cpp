@@ -70,8 +70,14 @@ static bool process_one_file(const fs::path& file, const fs::path& output_dir,
 struct FileResult {
     std::string name;
     bool        ok;
-    long long   ms;   // wall time from file start to file done, milliseconds
+    long long   ms;        // wall time from file start to file done, milliseconds
+    int         worker_id; // stable 0-based index of the worker thread
 };
+
+// Thread-local worker index: assigned once per OS thread the first time that
+// thread picks up a task.  Stable for the pool lifetime.
+static std::atomic<int>  s_next_worker_id{0};
+static thread_local int  tl_worker_id = -1;
 
 bool encode_folder_to_png(const char*           input_dir,
                           const char*           output_dir,
@@ -122,6 +128,12 @@ bool encode_folder_to_png(const char*           input_dir,
             total, workers,
             batch_cfg.batch_verbose ? "  [--batch-verbose: per-file times shown]" : "");
 
+    if (cfg.use_gpu_deflate)
+        pipeline_reset_gpu_batch_stats();
+
+    // Reset worker-ID counter so IDs are consistent across repeated batch runs.
+    s_next_worker_id.store(0);
+
     const fs::path    outdir(output_dir);
     std::atomic<int>  done_count{0};
     std::mutex        print_mtx;
@@ -134,6 +146,10 @@ bool encode_folder_to_png(const char*           input_dir,
 
     for (auto& f : files) {
         futs.push_back(pool.submit([&, f]() -> FileResult {
+            // Assign a stable 0-based ID the first time this OS thread runs a task.
+            if (tl_worker_id < 0) tl_worker_id = s_next_worker_id.fetch_add(1);
+            const int wid = tl_worker_id;
+
             auto t0  = Clock::now();
             bool ok  = process_one_file(f, outdir, cfg);
             auto t1  = Clock::now();
@@ -143,8 +159,8 @@ bool encode_folder_to_png(const char*           input_dir,
             {
                 std::lock_guard<std::mutex> lk(print_mtx);
                 if (batch_cfg.batch_verbose) {
-                    fprintf(stdout, "[%d/%d] %-40s  %-6s  (%lld ms)\n",
-                            n, total,
+                    fprintf(stdout, "[%d/%d] W%-2d  %-40s  %-6s  (%lld ms)\n",
+                            n, total, wid,
                             f.filename().string().c_str(),
                             ok ? "OK" : "FAILED",
                             ms);
@@ -155,7 +171,7 @@ bool encode_folder_to_png(const char*           input_dir,
                             ok ? "OK" : "FAILED");
                 }
             }
-            return FileResult{f.filename().string(), ok, ms};
+            return FileResult{f.filename().string(), ok, ms, wid};
         }));
     }
 
@@ -211,6 +227,10 @@ bool encode_folder_to_png(const char*           input_dir,
                 fprintf(stdout, "  FAILED  %s  (%lld ms)\n", r.name.c_str(), r.ms);
         }
     }
+
+    if (cfg.use_gpu_deflate)
+        pipeline_print_gpu_batch_summary(total, succeeded, (double)batch_ms / 1000.0,
+                                         sum_ms, workers);
 
     return all_ok;
 }

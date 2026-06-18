@@ -73,9 +73,20 @@ void gpu_deflate_reset(GpuDeflateContext* ctx);
 // Compress one strip. d_filtered must be GPU-resident, laid out as
 // actual_rows × row_bytes (filter byte + filtered pixels per row).
 // is_last must be true only for the last strip of the last frame.
+// This call is FULLY ASYNC — kernels are queued into ctx->stream but the
+// host is NOT blocked.  Call gpu_deflate_stream_sync() once the caller has
+// launched all concurrent work for this strip (e.g., the adler32 kernel in
+// its own stream), then sync before reading d_running_total or d_output.
 void gpu_deflate_compress_strip(GpuDeflateContext* ctx,
                                 const uint8_t* d_filtered, int actual_rows,
                                 int row_bytes, bool is_last);
+
+// Block the host until all work enqueued by the most recent
+// gpu_deflate_compress_strip() completes, then collect per-phase kernel
+// timings into ctx->acc_* accumulators.  Must be called before:
+//   • reading d_output or d_running_total on the host, and
+//   • starting a new strip if the next strip reads from d_output.
+void gpu_deflate_stream_sync(GpuDeflateContext* ctx);
 
 // Device pointer to the output bitstream.
 const uint8_t* gpu_deflate_output(const GpuDeflateContext* ctx);
@@ -98,3 +109,19 @@ void gpu_deflate_copy_to_host(const GpuDeflateContext* ctx, uint8_t* h_dst,
 // use_lz77=false or if no strips have been processed yet.
 // Expected to be called after the last gpu_deflate_compress_strip().
 LzStats gpu_deflate_lz_stats(const GpuDeflateContext* ctx);
+
+// Per-image GPU deflate kernel phase timings (cumulative across all strips
+// since the last gpu_deflate_reset / gpu_deflate_reset_phase_stats call).
+// Measured via CUDA Events (GPU wall-clock) for kernel phases and host-side
+// chrono for sync and stats-D2H overhead.
+struct GpuDeflatePhaseStats {
+    long long lz77_us      = 0;  // LZ77 match-finder kernel time (0 = literal path)
+    long long bitlen_us    = 0;  // kernel A/A': per-row Huffman bit lengths
+    long long scan_us      = 0;  // kernel B: 3-pass prefix scan
+    long long encode_us    = 0;  // kernels C+D+E: block header + encode + EOB
+    long long sync_us      = 0;  // host wait: cudaStreamSync stall per strip
+    long long stats_d2h_us = 0;  // LZ77 stats D2H readback (28 B/strip, blocking)
+};
+
+GpuDeflatePhaseStats gpu_deflate_get_phase_stats(const GpuDeflateContext* ctx);
+void                 gpu_deflate_reset_phase_stats(GpuDeflateContext* ctx);

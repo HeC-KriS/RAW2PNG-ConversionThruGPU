@@ -67,3 +67,22 @@ bool encode_dicom_to_png(const char* input_path,
 bool encode_dicom_all_frames_to_png(const char* input_path,
                                     const char* output_dir,
                                     const PipelineConfig& cfg);
+
+// GPU-deflate batch profiling. Call reset before the batch starts and
+// print_summary after all files finish. No-ops when use_gpu_deflate is false
+// (the accumulator is never written to in that case).
+void pipeline_reset_gpu_batch_stats();
+
+// Record per-file lifecycle timings for the consistency report.
+// Call once per file from inside encode_*_to_png() when use_gpu_deflate=true.
+//   dicom_ms  - DICOM open + load_frame time (0 for TIFF/RAW).
+//   total_ms  - encode_*_to_png() entry → return (dicom + pipeline).
+void pipeline_record_file_times(long long dicom_ms, long long total_ms);
+
+// sum_file_batch_ms: sum of per-file wall times as seen by batch_processor.cpp
+//   (independent ground truth for the TIMING CONSISTENCY REPORT).
+// num_workers: number of concurrent worker threads used for the batch.
+void pipeline_print_gpu_batch_summary(int total_files, int succeeded,
+                                      double total_wall_s,
+                                      long long sum_file_batch_ms,
+                                      int num_workers);
