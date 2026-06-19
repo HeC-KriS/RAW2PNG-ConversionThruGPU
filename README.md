@@ -21,45 +21,89 @@ The project is designed to maximize throughput by overlapping image loading, GPU
 
 ---
 
-## Architecture
+## 🚀 Architectural Overview
+
+The RAW2PNG GPU Encoder is a high-performance, streaming-based image processing pipeline designed to ingest large medical and raw images (DICOM, TIFF, RAW) and compress them into fully compliant PNG files utilizing GPU acceleration. By leveraging a strip-based streaming pipeline, the encoder drastically reduces VRAM requirements while maximizing hardware concurrency.
+
+---
+
+## 📊 Pipeline Stage & Algorithm Reference
+
+The following table details the execution mapping, input/output data, complexity, and architectural purpose of each stage in the current codebase.
+
+| Stage | Algorithm | Location | Input | Output | Complexity | Purpose |
+| --- | --- | --- | --- | --- | --- | --- |
+| **File Load** | Strip-based image streaming | `pipeline.cpp` | RAW/TIFF/DICOM | Image strips | $\mathcal{O}(N)$ | Prevents loading massive images entirely into VRAM. |
+| **DICOM Decode** | DCMTK/OpenJPEG decoded | `dicom_loader.cpp` | DICOM frame | Raw pixels | $\mathcal{O}(N)$ | Converts medical formats into standard pixel buffers. |
+| **Strip Scheduler** | Context Pool + Queue Pipeline | `pipeline.cpp` | Raw strips | GPU work items | $\mathcal{O}(S)$ | Continuous scheduling to keep the GPU fully saturated. |
+| **H2D Transfer** | Pinned-memory DMA | `gpu_filter.cu` | Host strip | Device strip | $\mathcal{O}(N)$ | High-speed, non-blocking PCIe upload. |
+| **PNG Filter** | Sub/Up/Average/Paeth selection | `gpu_filter.cu` | Raw pixels | Filtered rows | $\mathcal{O}(N)$ | Predictively transforms pixels to improve compression. |
+| **LZ77 Match** | GPU Hash-Table Match Search | `gpu_deflate_backend.cu` | Filtered rows | Literal/match stream | $\mathcal{O}(N)$ avg | Scans and extracts repeated sequences in parallel. |
+| **Huffman Bit-Len** | Fixed Huffman bit counting | `gpu_deflate_backend.cu` | Tokens | Bit counts | $\mathcal{O}(N)$ | Computes standard output positions for stream sizing. |
+| **Prefix Scan** | Parallel Exclusive Scan | `gpu_deflate_backend.cu` | Bit counts | Bit offsets | $\mathcal{O}(N)$ | Dynamically allocates exact output positions on-device. |
+| **Deflate Encode** | Fixed Huffman Encoding | `gpu_deflate_backend.cu` | Tokens | Compressed bitstream | $\mathcal{O}(N)$ | Generates standard RFC1951 compliant bitstreams. |
+| **Adler32** | Parallel Adler32 | `gpu_adler32.cu` | Deflate payload | Adler32 checksum | $\mathcal{O}(N)$ | Computes validation token required by the zlib stream. |
+| **PNG Assembly** | GPU IDAT Construction | `gpu_png_assemble.cu` | Deflate blocks | PNG chunks | $\mathcal{O}(N)$ | Formats raw bitstreams into valid PNG structures. |
+| **CRC32** | Host CRC32 | `gpu_png_assemble.cu` | PNG chunk | CRC value | $\mathcal{O}(N)$ | Validates individual PNG chunks. |
+| **D2H Transfer** | Chunk Copy | `gpu_png_assemble.cu` | PNG chunk | Host buffer | $\mathcal{O}(N)$ | Executes final output transfer back to system memory. |
+| **File Write** | Buffered file output | `png_writer.cpp` | PNG chunks | PNG file | $\mathcal{O}(N)$ | Persists finalized PNG chunks to physical disk. |
+
+---
+
+## 🔄 Current Phase-4 Data Flow
+
+The operational pipeline processes streaming chunks sequentially through host and device environments:
 
 ```text
-Input Image
-      │
-      ▼
-┌─────────────┐
-│ Loader      │
-└─────────────┘
-      │
-      ▼
- Queue A
-      │
-      ▼
-┌─────────────┐
-│ GPU Filter  │
-│ CUDA        │
-└─────────────┘
-      │
-      ▼
- Queue B
-      │
-      ▼
-┌─────────────┐
-│ zlib-ng     │
-│ Compression │
-└─────────────┘
-      │
-      ▼
- Queue C
-      │
-      ▼
-┌─────────────┐
-│ PNG Writer  │
-└─────────────┘
-      │
-      ▼
-    PNG
+[ DICOM / TIFF / RAW ]
+          │
+          ▼
+   [ Strip Loader ]
+          │
+          ▼
+ [ Pinned Host Buffer ]
+          │
+          ▼ (H2D PCIe Transfer)
+  [ GPU Filter Pool ] ─── (Sub / Up / Average / Paeth)
+          │
+          ▼
+     [ GPU LZ77 ] ─────── (Hash Match Search)
+          │
+          ▼
+[ GPU Bit-Length Pass ]
+          │
+          ▼
+  [ GPU Prefix Scan ]
+          │
+          ▼
+[ GPU Huffman Encode ]
+          │
+          ▼
+    [ GPU Adler32 ]
+          │
+          ▼
+  [ GPU PNG Assembly ]
+          │
+          ▼ (D2H PCIe Transfer)
+    [ Host CRC32 ]
+          │
+          ▼
+   [ PNG Writer ]
 ```
+
+---
+
+## 📈 Evolutionary Roadmap: Phase 0 to Phase 4
+
+### Phase 0: Naive Context Allocation
+* **Implementation:** Initialized, utilized, and destroyed the global GPU context per image.
+* **Result:** High performance penalty. CPU management overhead completely dominated execution time.
+
+### Phase 1: Pinned Host Memory Allocation
+* **Implementation:** Migrated from standard pageable vectors to pinned host memory.
+* **Result:** Eliminated double-copy overhead during PCIe transfers, significantly boosting Host-to-Device (H2D) throughput.
+
+*(Note: Documentation for subsequent phases is pending)*
 
 ---
 
