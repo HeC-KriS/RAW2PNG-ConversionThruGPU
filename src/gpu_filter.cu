@@ -311,7 +311,8 @@ __global__ void filter_select_kernel(
 // ---------------------------------------------------------------------------
 // Host-side API
 // ---------------------------------------------------------------------------
-GpuFilterContext* gpu_filter_create(int width, int bpp, int strip_height)
+GpuFilterContext* gpu_filter_create(int width, int bpp, int strip_height,
+                                    bool device_output_only)
 {
     GpuFilterContext* ctx = new GpuFilterContext();
     ctx->width        = width;
@@ -325,7 +326,11 @@ GpuFilterContext* gpu_filter_create(int width, int bpp, int strip_height)
     CHECK_CUDA(cudaMalloc(&ctx->d_input,    strip_bytes));
     CHECK_CUDA(cudaMalloc(&ctx->d_prior,    ctx->width_bytes));
     CHECK_CUDA(cudaMalloc(&ctx->d_selected, out_bytes));
-    CHECK_CUDA(cudaMallocHost(&ctx->h_output, out_bytes));
+    // h_output is only needed by the legacy path that copies d_selected to host.
+    // In the modern GPU-deflate path the compressed reads d_selected directly on
+    // the device, so we skip the allocation to save pinned memory.
+    if (!device_output_only)
+        CHECK_CUDA(cudaMallocHost(&ctx->h_output, out_bytes));
 
     // Zero the prior-row buffer (PNG spec: first strip's prior row = zeros)
     CHECK_CUDA(cudaMemset(ctx->d_prior, 0, ctx->width_bytes));
@@ -339,13 +344,25 @@ GpuFilterContext* gpu_filter_create(int width, int bpp, int strip_height)
     return ctx;
 }
 
+uint8_t* gpu_filter_alloc_pinned(size_t bytes)
+{
+    uint8_t* p = nullptr;
+    CHECK_CUDA(cudaMallocHost(&p, bytes));
+    return p;
+}
+
+void gpu_filter_free_pinned(uint8_t* ptr)
+{
+    if (ptr) cudaFreeHost(ptr);
+}
+
 void gpu_filter_destroy(GpuFilterContext* ctx)
 {
     if (!ctx) return;
     cudaFree(ctx->d_input);
     cudaFree(ctx->d_prior);
     cudaFree(ctx->d_selected);
-    cudaFreeHost(ctx->h_output);
+    if (ctx->h_output) cudaFreeHost(ctx->h_output);
     cudaEventDestroy(ctx->ev_start);
     cudaEventDestroy(ctx->ev_h2d_done);
     cudaEventDestroy(ctx->ev_kernels_done);

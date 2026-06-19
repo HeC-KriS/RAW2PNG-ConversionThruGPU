@@ -585,6 +585,7 @@ static void modern_filter_stage(
     const DicomPixelParams*          dicom,
     int                              total_strips,
     std::vector<GpuFilterContext*>&  pool,
+    uint8_t*                         strip_buf,  // caller-owned pinned buffer, strip_h × row_b
     BoundedQueue<GpuFilteredJob>&    qa,
     std::atomic<bool>&               error,
     ModernPipelineStats&             stats)
@@ -592,12 +593,11 @@ static void modern_filter_stage(
     using Clock = std::chrono::high_resolution_clock;
     const int pool_n = (int)pool.size();
 
-    std::vector<uint8_t> strip_buf((size_t)strip_h * row_b);
     std::vector<uint8_t> prev_row(row_b, 0);  // PNG spec: first row's "prior" is zeros
 
     for (int s = 0; s < total_strips && !error.load(); s++) {
         auto t0 = Clock::now();
-        const int actual_rows = src.read_strip(strip_buf.data(), strip_h);
+        const int actual_rows = src.read_strip(strip_buf, strip_h);
         auto t1 = Clock::now();
         stats.load_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         if (actual_rows <= 0) { error.store(true); break; }
@@ -606,7 +606,7 @@ static void modern_filter_stage(
 
         GpuTimings gt;
         auto t2 = Clock::now();
-        gpu_filter_process_from_host(ctx, strip_buf.data(), prev_row.data(),
+        gpu_filter_process_from_host(ctx, strip_buf, prev_row.data(),
                                      actual_rows, &gt, dicom,
                                      /*device_output_only=*/true);
         auto t3 = Clock::now();
@@ -615,10 +615,12 @@ static void modern_filter_stage(
         stats.gpu_kernel_us += (long long)(gt.kernel_ms * 1000.f);
         stats.gpu_d2h_us    += (long long)(gt.d2h_ms    * 1000.f);
 
-        // Thread the true last-row dependency forward explicitly -- see the
-        // file-level comment on why this is required when round-robining
-        // across an independent context pool.
-        gpu_filter_copy_prior_row_to_host(ctx, prev_row.data());
+        // Thread the true last-row dependency forward explicitly. Skip on the
+        // last strip: prev_row won't be read again so the D2H is wasted work.
+        // For single-strip images (most CT slices) this eliminates the only
+        // prior-row D2H+sync call entirely.
+        if (s < total_strips - 1)
+            gpu_filter_copy_prior_row_to_host(ctx, prev_row.data());
 
         GpuFilteredJob job;
         job.strip_index = s;
@@ -859,6 +861,7 @@ static bool run_one_modern(
     GpuDeflateContext*               gdef,
     GpuAdler32Context*                gadler,
     GpuPngAssembleContext*            passemble,
+    uint8_t*                          strip_buf,
     bool                              print_header,
     bool                              print_report)
 {
@@ -872,6 +875,7 @@ static bool run_one_modern(
 
     for (GpuFilterContext* ctx : filter_pool) gpu_filter_reset(ctx);
     gpu_deflate_reset(gdef);
+    gpu_png_assemble_reset_stats(passemble);
 
     auto t_abs_start = std::chrono::system_clock::now();
     if (print_header) {
@@ -934,7 +938,7 @@ static bool run_one_modern(
 
     std::thread t_filter([&] {
         modern_filter_stage(src, strip_h, row_b, dicom, total_strips,
-                            filter_pool, qa, error, stats);
+                            filter_pool, strip_buf, qa, error, stats);
     });
     std::thread t_compress([&] {
         modern_compress_stage(filter_pool, gdef, gadler, passemble, row_bytes_out,
@@ -1506,6 +1510,57 @@ void pipeline_print_gpu_batch_summary(int, int, double, long long, int) {}
 #endif  // GPU_PNG_MODERN_DEFLATE
 
 // ---------------------------------------------------------------------------
+// Per-worker persistent GPU context cache (Phase 2).
+//
+// The modern GPU pipeline creates 4 types of GPU contexts per image, each
+// with multiple cudaMalloc/cudaMallocHost/cudaStreamCreate calls. For a
+// 1424-file batch with pool_n=3 streams, this is thousands of slow driver
+// calls. This cache keeps contexts alive between images on the same worker
+// thread: on dimension match, contexts are simply reset (fast); only on a
+// dimension change are they destroyed and recreated.
+//
+// Thread-local lifetime: created lazily on first use, destroyed when the
+// worker thread exits (which is safe — CUDA context is still alive when
+// ThreadPool joins its threads before the primary context is released).
+// ---------------------------------------------------------------------------
+#if defined(GPU_PNG_MODERN_DEFLATE)
+struct ModernContextCache {
+    int    width = 0, bpp = 0, strip_height = 0, pool_n = 0;
+    bool   use_lz77   = false;
+    size_t total_filt = 0, max_chunk = 0, strip_bytes = 0;
+
+    std::vector<GpuFilterContext*> filter_pool;
+    GpuDeflateContext*     gdef      = nullptr;
+    GpuAdler32Context*     gadler    = nullptr;
+    GpuPngAssembleContext* passemble = nullptr;
+    uint8_t*               strip_buf = nullptr;
+
+    bool matches(int w, int b, int sh, int pn, bool lz77,
+                 size_t tf, size_t mc, size_t sb) const {
+        return gdef != nullptr
+            && width == w && bpp == b && strip_height == sh && pool_n == pn
+            && use_lz77 == lz77 && total_filt == tf && max_chunk == mc
+            && strip_bytes == sb;
+    }
+
+    void destroy_all() {
+        gpu_filter_free_pinned(strip_buf); strip_buf = nullptr;
+        for (auto* c : filter_pool) gpu_filter_destroy(c);
+        filter_pool.clear();
+        gpu_deflate_destroy(gdef);           gdef      = nullptr;
+        gpu_adler32_destroy(gadler);         gadler    = nullptr;
+        gpu_png_assemble_destroy(passemble); passemble = nullptr;
+        width = bpp = strip_height = pool_n = 0;
+        total_filt = max_chunk = strip_bytes = 0;
+    }
+
+    ~ModernContextCache() { destroy_all(); }
+};
+
+static thread_local ModernContextCache tl_modern_cache;
+#endif  // GPU_PNG_MODERN_DEFLATE
+
+// ---------------------------------------------------------------------------
 // Internal: single-image convenience wrapper.
 // Builds a GPU context (+ deflate backend), runs one image, tears them down.
 // Dispatches to the modern GPU-deflate path only when cfg.use_gpu_deflate is
@@ -1532,18 +1587,6 @@ static bool run_pipeline(
             int pool_size = (cfg.gpu_streams > 0) ? cfg.gpu_streams : 8;
             pool_size = std::max(pool_size, 3);
 
-            std::vector<GpuFilterContext*> filter_pool;
-            filter_pool.reserve(pool_size);
-            for (int i = 0; i < pool_size; i++) {
-                GpuFilterContext* ctx = gpu_filter_create(info.width, info.bpp, cfg.strip_height);
-                if (!ctx) {
-                    fprintf(stderr, "gpu_filter_create failed (pool slot %d)\n", i);
-                    for (GpuFilterContext* c : filter_pool) gpu_filter_destroy(c);
-                    return false;
-                }
-                filter_pool.push_back(ctx);
-            }
-
             const size_t row_bytes      = (size_t)info.width * info.bpp + 1;
             const int    total_strips    = ((int)info.height + cfg.strip_height - 1) / cfg.strip_height;
             const size_t total_filtered = (size_t)info.height * row_bytes;
@@ -1557,21 +1600,51 @@ static bool run_pipeline(
             // flushes everything in one chunk), plus 6 bytes slack for the
             // zlib header / Adler-32 trailer.
             const size_t max_chunk_data_bytes = max_compressed_bytes + 6;
+            const size_t strip_bytes = (size_t)cfg.strip_height * (size_t)info.width * info.bpp;
 
-            GpuDeflateContext* gdef = gpu_deflate_create(
-                cfg.strip_height, (int)row_bytes, max_total_bits,
-                cfg.use_gpu_lz77);
-            GpuAdler32Context* gadler = gpu_adler32_create(total_filtered);
-            GpuPngAssembleContext* passemble = gpu_png_assemble_create(max_chunk_data_bytes);
+            // Reuse per-worker GPU contexts across images (Phase 2).
+            // Contexts persist in the thread-local cache until dimensions change
+            // or the worker thread exits; run_one_modern resets state at its start.
+            ModernContextCache& cc = tl_modern_cache;
+            if (!cc.matches(info.width, info.bpp, cfg.strip_height, pool_size,
+                            cfg.use_gpu_lz77, total_filtered, max_chunk_data_bytes,
+                            strip_bytes)) {
+                cc.destroy_all();
 
-            bool ok = run_one_modern(cfg, output_path, source_label, src, filter_pool,
-                                     gdef, gadler, passemble, cfg.verbose, cfg.verbose);
+                cc.strip_buf = gpu_filter_alloc_pinned(strip_bytes);
+                if (!cc.strip_buf) {
+                    fprintf(stderr, "gpu_filter_alloc_pinned failed\n");
+                    return false;
+                }
 
-            gpu_png_assemble_destroy(passemble);
-            gpu_adler32_destroy(gadler);
-            gpu_deflate_destroy(gdef);
-            for (GpuFilterContext* c : filter_pool) gpu_filter_destroy(c);
-            return ok;
+                cc.filter_pool.reserve(pool_size);
+                for (int i = 0; i < pool_size; i++) {
+                    GpuFilterContext* ctx = gpu_filter_create(
+                        info.width, info.bpp, cfg.strip_height,
+                        /*device_output_only=*/true);
+                    if (!ctx) {
+                        fprintf(stderr, "gpu_filter_create failed (pool slot %d)\n", i);
+                        cc.destroy_all();
+                        return false;
+                    }
+                    cc.filter_pool.push_back(ctx);
+                }
+                cc.gdef = gpu_deflate_create(
+                    cfg.strip_height, (int)row_bytes, max_total_bits, cfg.use_gpu_lz77);
+                cc.gadler    = gpu_adler32_create(total_filtered);
+                cc.passemble = gpu_png_assemble_create(max_chunk_data_bytes);
+
+                cc.width = info.width; cc.bpp = info.bpp;
+                cc.strip_height = cfg.strip_height; cc.pool_n = pool_size;
+                cc.use_lz77 = cfg.use_gpu_lz77;
+                cc.total_filt = total_filtered;
+                cc.max_chunk  = max_chunk_data_bytes;
+                cc.strip_bytes = strip_bytes;
+            }
+
+            return run_one_modern(cfg, output_path, source_label, src,
+                                  cc.filter_pool, cc.gdef, cc.gadler, cc.passemble,
+                                  cc.strip_buf, cfg.verbose, cfg.verbose);
         }
         if (cfg.verbose)
             fprintf(stdout, "use_gpu_deflate requested but no modern GPU detected; using CPU deflate.\n");

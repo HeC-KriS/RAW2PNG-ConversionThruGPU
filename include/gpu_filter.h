@@ -15,8 +15,19 @@ struct GpuTimings {
     float d2h_ms    = 0.f;  // device-to-host transfer
 };
 
-GpuFilterContext* gpu_filter_create(int width, int bpp, int strip_height);
+// device_output_only: when true (modern GPU-deflate path) skips allocating the
+// pinned h_output buffer entirely. The modern path reads d_selected directly
+// via gpu_filter_device_output() and never touches h_output. Pass false (default)
+// for the legacy path that returns h_output from gpu_filter_process_from_host().
+GpuFilterContext* gpu_filter_create(int width, int bpp, int strip_height,
+                                    bool device_output_only = false);
 void              gpu_filter_destroy(GpuFilterContext* ctx);
+
+// Allocate/free CUDA pinned (page-locked) host memory. Wraps cudaMallocHost /
+// cudaFreeHost so callers in plain .cpp translation units (e.g. pipeline.cpp)
+// can use pinned strip buffers without including cuda_runtime.h themselves.
+uint8_t* gpu_filter_alloc_pinned(size_t bytes);
+void     gpu_filter_free_pinned(uint8_t* ptr);
 
 // Reset per-image filter state (zeros the prior-row buffer). Call this before
 // processing the first strip of a new image/frame when reusing a context, so

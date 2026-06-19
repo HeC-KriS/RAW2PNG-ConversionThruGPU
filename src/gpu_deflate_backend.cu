@@ -243,7 +243,8 @@ struct GpuDeflateContext {
     size_t* d_row_bits;       // [max_rows]
     size_t* d_row_offsets;    // [max_rows]
     size_t* d_literal_bits;   // [1]
-    size_t* d_running_total;  // [1]
+    size_t* d_running_total;  // [1] -- GPU-resident; shadowed on host by h_running_total
+    size_t* h_running_total;  // [1] pinned mirror of d_running_total; valid after stream sync
     size_t* d_strip_base_bit; // [1]
     size_t* d_eob_bit_pos;    // [1]
     size_t* d_block_sums;     // [ceil(max_rows/1024)+1] for multi-block scan
@@ -335,6 +336,8 @@ GpuDeflateContext* gpu_deflate_create(int max_rows, int max_row_bytes,
     CHECK_CUDA(cudaMalloc(&ctx->d_row_offsets,    sizeof(size_t) * max_rows));
     CHECK_CUDA(cudaMalloc(&ctx->d_literal_bits,   sizeof(size_t)));
     CHECK_CUDA(cudaMalloc(&ctx->d_running_total,  sizeof(size_t)));
+    CHECK_CUDA(cudaMallocHost(&ctx->h_running_total, sizeof(size_t)));
+    *ctx->h_running_total = 0;
     CHECK_CUDA(cudaMalloc(&ctx->d_strip_base_bit, sizeof(size_t)));
     CHECK_CUDA(cudaMalloc(&ctx->d_eob_bit_pos,    sizeof(size_t)));
     CHECK_CUDA(cudaMalloc(&ctx->d_block_sums,     sizeof(size_t) * max_blocks));
@@ -381,6 +384,7 @@ void gpu_deflate_destroy(GpuDeflateContext* ctx)
     cudaFree(ctx->d_row_offsets);
     cudaFree(ctx->d_literal_bits);
     cudaFree(ctx->d_running_total);
+    cudaFreeHost(ctx->h_running_total);
     cudaFree(ctx->d_strip_base_bit);
     cudaFree(ctx->d_eob_bit_pos);
     cudaFree(ctx->d_block_sums);
@@ -403,6 +407,7 @@ void gpu_deflate_reset(GpuDeflateContext* ctx)
     if (!ctx) return;
     // All memsets go into ctx->stream; the next compress_strip call also runs
     // in ctx->stream, so they are ordered by the stream without a host sync.
+    *ctx->h_running_total = 0;  // clear host mirror immediately (no data from prev image)
     CHECK_CUDA(cudaMemsetAsync(ctx->d_output, 0, ctx->max_total_bytes, ctx->stream));
     CHECK_CUDA(cudaMemsetAsync(ctx->d_running_total, 0, sizeof(size_t), ctx->stream));
     if (ctx->use_lz77) {
@@ -945,6 +950,12 @@ void gpu_deflate_compress_strip(GpuDeflateContext* ctx,
     // --- ev4: after all encode+EOB kernels C+D+E ---
     CHECK_CUDA(cudaEventRecord(ctx->ev4, ctx->stream));
 
+    // Shadow d_running_total to the pinned host mirror so that after
+    // gpu_deflate_stream_sync() returns the caller can read h_running_total
+    // without an extra D2H round-trip (Phase 3 optimization: eliminates S4 sync).
+    CHECK_CUDA(cudaMemcpyAsync(ctx->h_running_total, ctx->d_running_total,
+                               sizeof(size_t), cudaMemcpyDeviceToHost, ctx->stream));
+
     // No host sync here. Call gpu_deflate_stream_sync() after launching any
     // concurrent work (e.g., adler32) in another stream, then sync there.
     // Buffer-reuse safety (filter not overwriting d_filtered): guaranteed by the
@@ -994,23 +1005,17 @@ const uint8_t* gpu_deflate_output(const GpuDeflateContext* ctx)
     return ctx->d_output;
 }
 
-static size_t read_total_bits(const GpuDeflateContext* ctx)
-{
-    size_t total_bits = 0;
-    CHECK_CUDA(cudaMemcpyAsync(&total_bits, ctx->d_running_total, sizeof(size_t),
-                               cudaMemcpyDeviceToHost, ctx->stream));
-    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
-    return total_bits;
-}
-
+// h_running_total is updated by the last cudaMemcpyAsync queued in
+// gpu_deflate_compress_strip (after ev4). After gpu_deflate_stream_sync()
+// the value is host-visible; no further D2H or sync is required.
 size_t gpu_deflate_output_byte_length(const GpuDeflateContext* ctx)
 {
-    return (read_total_bits(ctx) + 7) / 8;
+    return (*ctx->h_running_total + 7) / 8;
 }
 
 size_t gpu_deflate_flushable_byte_length(const GpuDeflateContext* ctx)
 {
-    return read_total_bits(ctx) / 8;
+    return *ctx->h_running_total / 8;
 }
 
 void gpu_deflate_copy_to_host(const GpuDeflateContext* ctx, uint8_t* h_dst,
