@@ -1,6 +1,10 @@
 #pragma once
 #include <cstdint>
 
+struct ImageSource;  // forward declaration — full definition in image_source.h
+
+enum class ExportFormat { PNG, BMP };
+
 struct PipelineConfig {
     // Rows per GPU strip. 0 = auto: resolved once, right after CLI parsing,
     // to 1024 for the modern GPU-deflate path (empirically far faster than
@@ -38,8 +42,11 @@ struct PipelineConfig {
     // first strip to stdout after encoding (requires --verbose). Useful to
     // confirm the match finder is producing valid back-references.
     bool gpu_lz77_debug   = false;
+    // Export format: PNG (default) or BMP (fast, uncompressed, benchmark path).
+    ExportFormat format   = ExportFormat::PNG;
 };
 
+// ---- PNG encode (lossless, compressed) ------------------------------------
 bool encode_tiff_to_png(const char* input_path,
                         const char* output_path,
                         const PipelineConfig& cfg);
@@ -86,3 +93,30 @@ void pipeline_print_gpu_batch_summary(int total_files, int succeeded,
                                       double total_wall_s,
                                       long long sum_file_batch_ms,
                                       int num_workers);
+
+// ---- BMP encode (lossless, uncompressed, fastest export path) -------------
+// Converts all inputs to 8-bit grayscale (1-channel) or 24-bit BGR (3-channel).
+// For 16-bit DICOM: applies window/level from DicomPixelParams → 8-bit.
+// For 16-bit TIFF/RAW: takes the high 8 bits of each channel (no windowing).
+bool encode_dicom_to_bmp(const char* input_path,
+                         const char* output_path,
+                         const PipelineConfig& cfg);
+
+bool encode_tiff_to_bmp(const char* input_path,
+                        const char* output_path,
+                        const PipelineConfig& cfg);
+
+bool encode_raw_to_bmp(const char* input_path,
+                       const char* output_path,
+                       const PipelineConfig& cfg);
+
+// ---- Phase D2: source-based encode (batch scheduler decode-ahead path) ----
+// Encode directly from an already-decoded ImageSource, bypassing file-open.
+// encode_source_to_png: caller must call pipeline_record_file_times() for GPU stats.
+// encode_source_to_bmp: stateless, no GPU stats.
+bool encode_source_to_png(ImageSource& src,
+                          const char*  output_path,
+                          const PipelineConfig& cfg);
+
+bool encode_source_to_bmp(ImageSource& src,
+                          const char*  output_path);

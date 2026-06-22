@@ -137,6 +137,7 @@ set(SOURCES
     src/gpu_filter.cu
     src/parallel_deflate.cpp
     src/png_writer.cpp
+    src/bmp_writer.cpp
     src/image_loader.cpp
     src/pipeline.cpp
     src/gpu_capability.cpp

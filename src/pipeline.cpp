@@ -1877,3 +1877,191 @@ bool encode_dicom_all_frames_to_png(const char* input_path,
     }
     return all_ok.load();
 }
+
+// ===========================================================================
+// BMP export path (Phase D1)
+//
+// CPU-only: no GPU, no compression. Pipeline is:
+//   open source → stream strips → per-row pixel transform → write BMP
+//
+// This is the fastest export path. Throughput is limited by disk I/O and
+// DICOM decode, not compute. All pixel transforms are done inline.
+// ===========================================================================
+#include "bmp_writer.h"
+
+// ---------------------------------------------------------------------------
+// 16-bit LE DICOM → 8-bit grayscale using DicomPixelParams window/level.
+// norm_scale / norm_offset are used when apply_window=0 (full bit-depth range).
+// ---------------------------------------------------------------------------
+static void dicom16_row_to_gray8(const uint8_t* src_le, uint8_t* dst, int width,
+                                  const DicomPixelParams& p,
+                                  float norm_scale, float norm_offset)
+{
+    const int shift = p.high_bit - p.bits_stored + 1;
+    const int mask  = (p.bits_stored < 32) ? ((1 << p.bits_stored) - 1) : -1;
+
+    for (int x = 0; x < width; x++) {
+        uint16_t raw_u = (uint16_t)((int)src_le[x * 2] | ((int)src_le[x * 2 + 1] << 8));
+        raw_u = (uint16_t)((raw_u >> shift) & mask);
+
+        float val;
+        if (p.pixel_rep == 1 && p.bits_stored < 16) {
+            // Sign-extend to int32 for narrow signed types
+            int sign_bit = 1 << (p.bits_stored - 1);
+            int32_t s = (int32_t)(uint32_t)raw_u;
+            if (s & sign_bit) s |= ~((int32_t)mask);
+            val = (float)s;
+        } else if (p.pixel_rep == 1) {
+            val = (float)(int16_t)raw_u;
+        } else {
+            val = (float)raw_u;
+        }
+
+        if (p.apply_rescale)
+            val = val * p.rescale_slope + p.rescale_intercept;
+
+        float norm;
+        if (p.apply_window) {
+            float lo = p.window_center - p.window_width * 0.5f;
+            float hi = p.window_center + p.window_width * 0.5f;
+            norm = (hi > lo) ? (val - lo) / (hi - lo) : 0.f;
+        } else {
+            norm = val * norm_scale + norm_offset;
+        }
+
+        int v = (int)(norm * 255.f + 0.5f);
+        dst[x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified any-source → BMP.
+//
+// DICOM (dicom_params() != nullptr): 16-bit LE with window/level → 8-bit gray.
+// TIFF/RAW (dicom_params() == nullptr): 16-bit BE big-endian → take MSB.
+// 8-bit inputs: pass through (bmp_write_row handles RGB→BGR for colour).
+// ---------------------------------------------------------------------------
+static bool run_bmp_from_source(const char* output_path, ImageSource& src)
+{
+    const ImageInfo&        info  = src.info();
+    const DicomPixelParams* p_ptr = src.dicom_params();  // null for TIFF/RAW
+    const int out_channels = (info.channels == 1) ? 1 : 3;
+
+    // Precompute full-range normalisation constants for DICOM 16-bit without window.
+    float norm_scale = 1.f, norm_offset = 0.f;
+    if (p_ptr && info.bits_per_sample == 16 && !p_ptr->apply_window) {
+        if (p_ptr->pixel_rep == 1) {
+            float half  = (float)(1u << (p_ptr->bits_stored - 1));
+            float range = (float)(1u << p_ptr->bits_stored);
+            norm_scale  = 1.f / range;
+            norm_offset = half / range;
+        } else {
+            norm_scale  = 1.f / (float)((1u << p_ptr->bits_stored) - 1u);
+        }
+    }
+
+    BmpWriter bmp;
+    if (!bmp_open(bmp, output_path, (int)info.width, (int)info.height, out_channels)) {
+        fprintf(stderr, "Cannot create BMP: %s\n", output_path);
+        return false;
+    }
+
+    const int    strip_h = 64;
+    const size_t row_raw = (size_t)info.width * (size_t)info.bpp;
+    std::vector<uint8_t> strip_buf((size_t)strip_h * row_raw);
+    std::vector<uint8_t> row8((size_t)info.width * (size_t)out_channels);
+
+    bool ok = true;
+    for (int rows_done = 0; rows_done < (int)info.height && ok; ) {
+        int got = src.read_strip(strip_buf.data(), strip_h);
+        if (got <= 0) { ok = false; break; }
+
+        for (int r = 0; r < got && ok; r++) {
+            const uint8_t* row_src = strip_buf.data() + (size_t)r * row_raw;
+
+            if (p_ptr && info.bits_per_sample == 16 && info.channels == 1) {
+                // DICOM 16-bit LE grayscale → 8-bit with window/level
+                dicom16_row_to_gray8(row_src, row8.data(), info.width, *p_ptr,
+                                     norm_scale, norm_offset);
+                ok = bmp_write_row(bmp, row8.data());
+            } else if (info.bits_per_sample == 16) {
+                // Non-DICOM 16-bit BE (TIFF/RAW): take MSB of each sample
+                for (int x = 0; x < info.width; x++)
+                    for (int c = 0; c < out_channels; c++)
+                        row8[(size_t)x * out_channels + c] =
+                            row_src[(size_t)(x * info.channels + c) * 2];
+                ok = bmp_write_row(bmp, row8.data());
+            } else {
+                // 8-bit: pass through (bmp_write_row does RGB→BGR for colour)
+                ok = bmp_write_row(bmp, row_src);
+            }
+        }
+        rows_done += got;
+    }
+
+    bmp_close(bmp);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Public BMP entry points
+// ---------------------------------------------------------------------------
+bool encode_dicom_to_bmp(const char* input_path,
+                         const char* output_path,
+                         const PipelineConfig& cfg)
+{
+    DicomSource src;
+    if (!src.open(input_path)) {
+        fprintf(stderr, "Cannot open DICOM: %s\n", input_path);
+        return false;
+    }
+    const int frame = (cfg.frame >= 0) ? cfg.frame : 0;
+    if (frame >= src.num_frames()) {
+        fprintf(stderr, "DICOM: requested frame %d but file has %d frame(s)\n",
+                frame, src.num_frames());
+        return false;
+    }
+    if (!src.load_frame(frame)) return false;
+    return run_bmp_from_source(output_path, src);
+}
+
+bool encode_tiff_to_bmp(const char* input_path,
+                        const char* output_path,
+                        const PipelineConfig& /*cfg*/)
+{
+    TiffSource src;
+    if (!src.open(input_path)) {
+        fprintf(stderr, "Cannot open TIFF: %s\n", input_path);
+        return false;
+    }
+    return run_bmp_from_source(output_path, src);
+}
+
+bool encode_raw_to_bmp(const char* input_path,
+                       const char* output_path,
+                       const PipelineConfig& /*cfg*/)
+{
+    RawSource src;
+    if (!src.open(input_path)) {
+        fprintf(stderr, "Cannot open RAW: %s\n", input_path);
+        return false;
+    }
+    return run_bmp_from_source(output_path, src);
+}
+
+// ---------------------------------------------------------------------------
+// Phase D2: source-based encode (bypasses file-open step).
+// Used by the batch scheduler after pre-decoding a DICOM frame on a decode
+// thread. The caller is responsible for calling pipeline_record_file_times()
+// with the external decode time when use_gpu_deflate is set.
+// ---------------------------------------------------------------------------
+bool encode_source_to_png(ImageSource& src, const char* output_path,
+                          const PipelineConfig& cfg)
+{
+    return run_pipeline(cfg, output_path, "DICOM", src);
+}
+
+bool encode_source_to_bmp(ImageSource& src, const char* output_path)
+{
+    return run_bmp_from_source(output_path, src);
+}

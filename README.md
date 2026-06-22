@@ -21,89 +21,45 @@ The project is designed to maximize throughput by overlapping image loading, GPU
 
 ---
 
-## 🚀 Architectural Overview
-
-The RAW2PNG GPU Encoder is a high-performance, streaming-based image processing pipeline designed to ingest large medical and raw images (DICOM, TIFF, RAW) and compress them into fully compliant PNG files utilizing GPU acceleration. By leveraging a strip-based streaming pipeline, the encoder drastically reduces VRAM requirements while maximizing hardware concurrency.
-
----
-
-## 📊 Pipeline Stage & Algorithm Reference
-
-The following table details the execution mapping, input/output data, complexity, and architectural purpose of each stage in the current codebase.
-
-| Stage | Algorithm | Location | Input | Output | Complexity | Purpose |
-| --- | --- | --- | --- | --- | --- | --- |
-| **File Load** | Strip-based image streaming | `pipeline.cpp` | RAW/TIFF/DICOM | Image strips | $\mathcal{O}(N)$ | Prevents loading massive images entirely into VRAM. |
-| **DICOM Decode** | DCMTK/OpenJPEG decoded | `dicom_loader.cpp` | DICOM frame | Raw pixels | $\mathcal{O}(N)$ | Converts medical formats into standard pixel buffers. |
-| **Strip Scheduler** | Context Pool + Queue Pipeline | `pipeline.cpp` | Raw strips | GPU work items | $\mathcal{O}(S)$ | Continuous scheduling to keep the GPU fully saturated. |
-| **H2D Transfer** | Pinned-memory DMA | `gpu_filter.cu` | Host strip | Device strip | $\mathcal{O}(N)$ | High-speed, non-blocking PCIe upload. |
-| **PNG Filter** | Sub/Up/Average/Paeth selection | `gpu_filter.cu` | Raw pixels | Filtered rows | $\mathcal{O}(N)$ | Predictively transforms pixels to improve compression. |
-| **LZ77 Match** | GPU Hash-Table Match Search | `gpu_deflate_backend.cu` | Filtered rows | Literal/match stream | $\mathcal{O}(N)$ avg | Scans and extracts repeated sequences in parallel. |
-| **Huffman Bit-Len** | Fixed Huffman bit counting | `gpu_deflate_backend.cu` | Tokens | Bit counts | $\mathcal{O}(N)$ | Computes standard output positions for stream sizing. |
-| **Prefix Scan** | Parallel Exclusive Scan | `gpu_deflate_backend.cu` | Bit counts | Bit offsets | $\mathcal{O}(N)$ | Dynamically allocates exact output positions on-device. |
-| **Deflate Encode** | Fixed Huffman Encoding | `gpu_deflate_backend.cu` | Tokens | Compressed bitstream | $\mathcal{O}(N)$ | Generates standard RFC1951 compliant bitstreams. |
-| **Adler32** | Parallel Adler32 | `gpu_adler32.cu` | Deflate payload | Adler32 checksum | $\mathcal{O}(N)$ | Computes validation token required by the zlib stream. |
-| **PNG Assembly** | GPU IDAT Construction | `gpu_png_assemble.cu` | Deflate blocks | PNG chunks | $\mathcal{O}(N)$ | Formats raw bitstreams into valid PNG structures. |
-| **CRC32** | Host CRC32 | `gpu_png_assemble.cu` | PNG chunk | CRC value | $\mathcal{O}(N)$ | Validates individual PNG chunks. |
-| **D2H Transfer** | Chunk Copy | `gpu_png_assemble.cu` | PNG chunk | Host buffer | $\mathcal{O}(N)$ | Executes final output transfer back to system memory. |
-| **File Write** | Buffered file output | `png_writer.cpp` | PNG chunks | PNG file | $\mathcal{O}(N)$ | Persists finalized PNG chunks to physical disk. |
-
----
-
-## 🔄 Current Phase-4 Data Flow
-
-The operational pipeline processes streaming chunks sequentially through host and device environments:
+## Architecture
 
 ```text
-[ DICOM / TIFF / RAW ]
-          │
-          ▼
-   [ Strip Loader ]
-          │
-          ▼
- [ Pinned Host Buffer ]
-          │
-          ▼ (H2D PCIe Transfer)
-  [ GPU Filter Pool ] ─── (Sub / Up / Average / Paeth)
-          │
-          ▼
-     [ GPU LZ77 ] ─────── (Hash Match Search)
-          │
-          ▼
-[ GPU Bit-Length Pass ]
-          │
-          ▼
-  [ GPU Prefix Scan ]
-          │
-          ▼
-[ GPU Huffman Encode ]
-          │
-          ▼
-    [ GPU Adler32 ]
-          │
-          ▼
-  [ GPU PNG Assembly ]
-          │
-          ▼ (D2H PCIe Transfer)
-    [ Host CRC32 ]
-          │
-          ▼
-   [ PNG Writer ]
+Input Image
+      │
+      ▼
+┌─────────────┐
+│ Loader      │
+└─────────────┘
+      │
+      ▼
+ Queue A
+      │
+      ▼
+┌─────────────┐
+│ GPU Filter  │
+│ CUDA        │
+└─────────────┘
+      │
+      ▼
+ Queue B
+      │
+      ▼
+┌─────────────┐
+│ zlib-ng     │
+│ Compression │
+└─────────────┘
+      │
+      ▼
+ Queue C
+      │
+      ▼
+┌─────────────┐
+│ PNG Writer  │
+└─────────────┘
+      │
+      ▼
+    PNG
 ```
-
----
-
-## 📈 Evolutionary Roadmap: Phase 0 to Phase 4
-
-### Phase 0: Naive Context Allocation
-* **Implementation:** Initialized, utilized, and destroyed the global GPU context per image.
-* **Result:** High performance penalty. CPU management overhead completely dominated execution time.
-
-### Phase 1: Pinned Host Memory Allocation
-* **Implementation:** Migrated from standard pageable vectors to pinned host memory.
-* **Result:** Eliminated double-copy overhead during PCIe transfers, significantly boosting Host-to-Device (H2D) throughput.
-
-*(Note: Documentation for subsequent phases is pending)*
 
 ---
 
@@ -226,100 +182,53 @@ The encoder manually constructs PNG chunks to provide complete control over:
 
 ---
 
-## Setup and Build
+## Build
 
 ```bash
 git clone https://github.com/ProjectBA14/RAW2PNG-ConversionThruGPU.git
 cd RAW2PNG-ConversionThruGPU
 
-# Build the C++ executable
 cmake -B build
 cmake --build build --config Release
 ```
 
-Make sure you have Python 3.x installed to use the testing and automation scripts.
-
 ---
 
-## Usage (via `Testing.py`)
+## Usage
 
-The most efficient way to run and benchmark the pipeline is using the provided `Testing.py` script. It wraps the C++ executable and provides easy configuration for batch processing, multi-threading, and GPU acceleration.
-
-### How to Run
-
-1. Open `Testing.py` in your preferred text editor.
-2. Update the `EXE` variable to point to your compiled executable (e.g., `r"D:\Projects\gpu-optimize\build\gpu_png_encoder.exe"`).
-3. Set your `INPUT_PATH` (a single file or a directory of DICOMs) and `OUTPUT_PATH`.
-4. Run the script:
 ```bash
-python Testing.py
+gpu_png_encoder input.dcm output.png
 ```
 
-### Parameters in `Testing.py`
+### Options
 
-| Parameter | Description |
-| --------- | ----------- |
-| `EXE` | Absolute path to the compiled `gpu_png_encoder.exe` executable. |
-| `INPUT_PATH` | Path to the input image file or directory containing files to process. |
-| `OUTPUT_PATH` | Path where the output PNG file(s) will be saved. |
-| `STRIP_HEIGHT` | Number of rows processed per GPU strip. Lower values reduce memory but increase overhead. |
-| `THREADS` | Number of CPU compression worker threads. |
-| `LEVEL` | Deflate compression level (0–9). 0 is no compression (fastest). |
-| `GPU_DEFLATE` | Enable (`1`) or disable (`0`) GPU-accelerated Deflate compression. |
-| `GPU_LZ77` | Enable (`1`) or disable (`0`) GPU-accelerated LZ77 compression. |
-| `GPU_STREAMS` | Number of concurrent CUDA streams to use. Set to `None` for batch mode. |
-| `BATCH_WORKERS` | Number of parallel worker processes for batch directory conversions. |
-| `VERBOSE` | Set to `True` to print detailed performance metrics per file. |
-| `BATCH_VERBOSE` | Set to `True` to print metrics during batch processing. |
-| `EXPORT_ALL` | Set to `True` to export all frames from a multi-frame DICOM file. |
-| `FRAME_NUMBER` | Specify a single frame index to extract from a multi-frame DICOM. |
+```bash
+gpu_png_encoder input.dcm output.png --strip-height 128
+gpu_png_encoder input.dcm output.png --threads 1
+gpu_png_encoder input.dcm output.png --level 0
+gpu_png_encoder input.dcm output.png --verbose
+```
+
+| Option           | Description                          |
+| ---------------- | ------------------------------------ |
+| --strip-height N | Rows processed per GPU strip         |
+| --threads N      | Number of compression worker threads |
+| --level N        | Compression level (0–9)              |
+| --verbose        | Print performance metrics            |
 
 ---
 
-## Detailed Process Pipeline
+## Performance-Oriented Design
 
-The pipeline dynamically adapts to your hardware, splitting into two variants:
-* **Legacy Pipeline (GT 710, SM 3.5):** Uses the GPU for fast filtering, but transfers data back to the CPU for multi-threaded Deflate compression.
-* **Modern Pipeline (RTX 5050+, SM >= 7.0):** Keeps data fully resident on the GPU across Filtering, Deflate compression, Checksums, and PNG Assembly.
+The project focuses on minimizing end-to-end conversion time through:
 
-### Step 1: Loader (Input Stage)
-* **Hardware:** **CPU**
-* **Algorithms:** Parses input formats (DICOM, TIFF, RAW).
-* **Process:** The CPU reads the image from disk in horizontal "strips" (e.g., 1024 rows at a time). This bounds memory usage so we can process arbitrarily large images. The CPU allocates memory on the GPU and transfers the raw data using asynchronous CUDA streams.
-
-### Step 2: DICOM Preprocessing (Optional)
-* **Hardware:** **GPU**
-* **Algorithms:** Bit Alignment, Window/Level Transformation (Rescale Slope/Intercept), Big-Endian Conversion.
-* **Process:** For medical images, a specialized CUDA kernel (`dicom_preprocess_kernel`) runs thousands of threads to align bits, adjust brightness/contrast, and flip bytes to match PNG's Big-Endian requirement. This is done **in-place**, meaning it directly overwrites the raw data to save massive amounts of GPU memory.
-
-### Step 3: PNG Scanline Filtering
-* **Hardware:** **GPU**
-* **Algorithms:** PNG Filters (None, Sub, Up, Average, Paeth), Block-wide Reduction.
-* **Process:** The core `filter_select_kernel` evaluates all 5 PNG filters simultaneously. The GPU assigns one Block (256 threads) per image row. The threads calculate a "score" for each filter, use ultra-fast **Shared Memory** to run a tournament-style "Block-wide reduction" to find the most compressible filter, and immediately apply the winner. This single-pass design reduces GPU memory transfers by 300%.
-
-### Step 4: Compression (Deflate / LZ77)
-* **Hardware:** **CPU** (Legacy) or **GPU** (Modern)
-* **Algorithms:** DEFLATE, LZ77 Match Finding.
-* **Process:** 
-  * **Legacy Pipeline:** Filtered data is sent back to the CPU where it is compressed using highly optimized multi-threaded **zlib-ng**.
-  * **Modern Pipeline:** Data stays on the GPU. A custom Fixed Huffman DEFLATE encoder handles the compression. You can use the ultra-fast **Literal-only** mode, or enable the `--gpu-lz77` flag, which launches a parallel LZ4-style match finder using Shared Memory hash tables to find repetitive byte sequences and improve compression ratio.
-
-### Step 5: Checksums & PNG Assembly
-* **Hardware:** **CPU** (Legacy) or **GPU** (Modern)
-* **Algorithms:** CRC32, Adler32.
-* **Process:** The PNG standard strictly requires cryptographic checksums. In the modern pipeline, the GPU calculates these checksums and physically assembles the binary PNG chunks (like the `IDAT` headers) directly in VRAM.
-
-### Step 6: PNG Writer (Output Stage)
-* **Hardware:** **CPU**
-* **Process:** The CPU receives the final, compressed binary chunks from the GPU (or from the CPU compression threads) and writes them to the output `.png` file on the hard drive.
-
----
-
-## Architectural Enhancements
-
-* **Zero-Copy Modern Pipeline:** By keeping data resident on the GPU through the entire filter, compress, and assemble stages, we eliminate the severe bottleneck of Host-to-Device (H2D) and Device-to-Host (D2H) memory transfers.
-* **Asynchronous Stream Overlap:** The modern pipeline maintains a pool of 4–8 CUDA streams, allowing the CPU to upload the *next* image strip while the GPU is still crunching numbers on the *current* strip.
-* **Bounded Queue Concurrency:** A robust producer/consumer architecture ensures that no matter how large the input image, the program's RAM usage remains strictly capped by the queue sizes.
+* GPU-accelerated pixel processing
+* zlib-ng optimized compression
+* Compression Level 0 encoding
+* Strip-based streaming
+* Bounded memory queues
+* Concurrent pipeline execution
+* Low-overhead PNG generation
 
 ---
 

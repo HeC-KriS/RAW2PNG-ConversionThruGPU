@@ -18,20 +18,25 @@ OUTPUT_PATH = r"C:\Users\Krish\Downloads\images_out"
 # ==========================================================
 
 STRIP_HEIGHT = 1024
-THREADS = 5
+THREADS = 8
 LEVEL = 1
 
 GPU_DEFLATE = 1
 GPU_LZ77 = 1
 
-# GPU_STREAMS is ignored in batch mode; set to None or use for single-file runs
+# GPU_STREAMS: ignored in batch mode; only matters for single-file runs
 GPU_STREAMS = None
-BATCH_WORKERS = 6  # Phase 4 optimal: 539 files/sec at 2639ms for CT_CHEST
+BATCH_WORKERS = 6  # Phase 4 PNG optimal: 539 files/sec
+
+# Export format: "png" (lossless, compressed) or "bmp" (fastest, uncompressed 8-bit gray)
+# BMP peak: ~800 files/sec at 6W (1.48x faster than PNG for CT datasets)
+
 
 VERBOSE = False
 BATCH_VERBOSE = False
-
-# ==========================================================W
+FORMAT = "bmp"            # "png" or "bmp"
+BENCHMARK_DECODE = False  # True → --benchmark-decode (no output written, measures DCMTK ceiling)
+# ==========================================================
 # DICOM OPTIONS
 # ==========================================================
 
@@ -48,6 +53,7 @@ cmd.extend([
     "--strip-height", str(STRIP_HEIGHT),
     "--threads", str(THREADS),
     "--level", str(LEVEL),
+    "--format", FORMAT,
 ])
 
 if GPU_DEFLATE:
@@ -76,6 +82,9 @@ if FRAME_NUMBER is not None:
         "--frame",
         str(FRAME_NUMBER)
     ])
+
+if BENCHMARK_DECODE:
+    cmd.append("--benchmark-decode")
 
 if VERBOSE:
     cmd.append("--verbose")

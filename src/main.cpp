@@ -62,6 +62,11 @@ static void usage(const char* prog)
         "  --no-gpu-lz77        disable GPU LZ77 (keep literal-only GPU deflate)\n"
         "  --gpu-lz77-debug     with --gpu-lz77 --verbose: print match stats and\n"
         "                       confirm matches are valid back-references\n"
+        "  --format png|bmp     output format (default: png)\n"
+        "                       bmp: fastest path, lossless, uncompressed 8-bit gray/24-bit BGR\n"
+        "  --benchmark-decode   decode-only mode: open + decompress pixels, no encode/write.\n"
+        "                       Measures true DCMTK/libtiff/LibRaw ingest ceiling and\n"
+        "                       worker utilization. Works in folder and single-file modes.\n"
         "  --bench-deflate [N]  standalone deflate benchmark on N bytes\n"
         "                       (default 2400000); no input file needed\n",
         prog);
@@ -97,7 +102,8 @@ int main(int argc, char* argv[])
 
     PipelineConfig cfg;
     BatchConfig    batch_cfg;
-    bool all_frames = false;
+    bool all_frames       = false;
+    bool benchmark_decode = false;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--strip-height") == 0 && i + 1 < argc)
             cfg.strip_height = atoi(argv[++i]);
@@ -125,6 +131,19 @@ int main(int argc, char* argv[])
             cfg.use_gpu_lz77 = false;
         else if (strcmp(argv[i], "--gpu-lz77-debug") == 0)
             cfg.gpu_lz77_debug = true;
+        else if (strcmp(argv[i], "--benchmark-decode") == 0)
+            benchmark_decode = true;
+        else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            const char* fmt = argv[++i];
+            if (strcmp(fmt, "png") == 0 || strcmp(fmt, "PNG") == 0)
+                cfg.format = ExportFormat::PNG;
+            else if (strcmp(fmt, "bmp") == 0 || strcmp(fmt, "BMP") == 0)
+                cfg.format = ExportFormat::BMP;
+            else {
+                fprintf(stderr, "Unknown format '%s'. Supported: png, bmp\n", fmt);
+                return 1;
+            }
+        }
         else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -166,7 +185,11 @@ int main(int argc, char* argv[])
     // Folder batch mode: input is a directory.
     std::error_code fs_ec;
     if (std::filesystem::is_directory(input, fs_ec)) {
-        bool ok = encode_folder_to_png(input, output, cfg, batch_cfg);
+        if (benchmark_decode) {
+            bool ok = benchmark_decode_folder(input, cfg, batch_cfg);
+            return ok ? 0 : 1;
+        }
+        bool ok = encode_folder(input, output, cfg, batch_cfg);
         if (!ok) {
             fprintf(stderr, "Batch encoding finished with errors.\n");
             return 1;
@@ -174,37 +197,52 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+    // Single-file decode benchmark (no output written).
+    if (benchmark_decode) {
+        bool ok = benchmark_decode_file(input, cfg);
+        return ok ? 0 : 1;
+    }
+
     const bool is_tiff = is_tiff_file(input);
     const bool is_raw  = is_raw_file(input);
+    const bool use_bmp = (cfg.format == ExportFormat::BMP);
 
-    // --all only applies to DICOM (TIFF/RAW are always single-image here).
-    if (all_frames && (is_tiff || is_raw)) {
-        fprintf(stderr, "Note: --all applies only to DICOM; ignoring for this input.\n");
+    // --all only applies to DICOM PNG (BMP is single-frame; TIFF/RAW always single).
+    if (all_frames && (is_tiff || is_raw || use_bmp)) {
+        fprintf(stderr, "Note: --all applies only to DICOM PNG mode; ignoring.\n");
         all_frames = false;
     }
 
-    // Dispatch: try DICOM first (header sniff covers files with no/unknown extension),
-    // then TIFF, then RAW camera.
+    // Dispatch by format then file type.
     bool ok = false;
-    if (is_tiff) {
-        ok = encode_tiff_to_png(input, output, cfg);
-    } else if (is_raw) {
-        ok = encode_raw_to_png(input, output, cfg);
-    } else if (is_dicom_file(input)) {
-        // Covers: .dcm .dicom .dic .ima  +  numeric names  +  no-extension DICOM
-        // The sniff_dicom_magic check reads 132 bytes and verifies the "DICM"
-        // preamble — this is the only reliable way to detect DICOM without an
-        // extension (very common on PACS systems and DICOM CDs).
-        if (all_frames) ok = encode_dicom_all_frames_to_png(input, output, cfg);
-        else            ok = encode_dicom_to_png(input, output, cfg);
+    if (use_bmp) {
+        if (is_tiff)
+            ok = encode_tiff_to_bmp(input, output, cfg);
+        else if (is_raw)
+            ok = encode_raw_to_bmp(input, output, cfg);
+        else if (is_dicom_file(input))
+            ok = encode_dicom_to_bmp(input, output, cfg);
+        else {
+            ok = encode_dicom_to_bmp(input, output, cfg);
+            if (!ok) ok = encode_raw_to_bmp(input, output, cfg);
+            if (!ok) ok = encode_tiff_to_bmp(input, output, cfg);
+        }
     } else {
-        // Unknown extension: try DICOM first, then RAW, then TIFF.
-        if (all_frames) {
-            ok = encode_dicom_all_frames_to_png(input, output, cfg);
+        if (is_tiff) {
+            ok = encode_tiff_to_png(input, output, cfg);
+        } else if (is_raw) {
+            ok = encode_raw_to_png(input, output, cfg);
+        } else if (is_dicom_file(input)) {
+            if (all_frames) ok = encode_dicom_all_frames_to_png(input, output, cfg);
+            else            ok = encode_dicom_to_png(input, output, cfg);
         } else {
-            ok = encode_dicom_to_png(input, output, cfg);
-            if (!ok) ok = encode_raw_to_png(input, output, cfg);
-            if (!ok) ok = encode_tiff_to_png(input, output, cfg);
+            if (all_frames) {
+                ok = encode_dicom_all_frames_to_png(input, output, cfg);
+            } else {
+                ok = encode_dicom_to_png(input, output, cfg);
+                if (!ok) ok = encode_raw_to_png(input, output, cfg);
+                if (!ok) ok = encode_tiff_to_png(input, output, cfg);
+            }
         }
     }
 
