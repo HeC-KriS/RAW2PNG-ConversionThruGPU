@@ -17,6 +17,9 @@
 #include "dicom_loader.h"
 #include "image_loader.h"   // tiff_open/tiff_read_strip/tiff_close, raw_open/raw_read_strip/raw_close
 #include "image_source.h"
+#include "jls_encoder.h"
+#include "gpu_jls_backend.h"
+#include "gpu_bmp_backend.h"
 #include "thread_pool.h"
 
 #include <algorithm>
@@ -50,6 +53,10 @@ struct PreDecodedFrame {
     DicomPixelParams params;
     std::vector<uint8_t> pixels;
     long long        decode_ms        = 0;
+    long long        file_open_us     = 0;
+    long long        file_read_us     = 0;
+    long long        dicom_parse_us   = 0;
+    long long        pixel_decode_us  = 0;
     bool             needs_all_frames = false; // multi-frame PNG → re-open in enc task
     bool             decode_ok        = false;
 };
@@ -335,13 +342,23 @@ static PreDecodedFrame decode_dicom_to_frame(const fs::path& file,
     result.input_path = file.string();
     result.filename   = file.filename().string();
 
-    auto t0 = Clock::now();
+    auto t_start = Clock::now();
+
+    FILE* f = fopen(result.input_path.c_str(), "rb");
+    if (!f) {
+        result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t_start).count();
+        return result;
+    }
+    fclose(f);
+    auto t_opened = Clock::now();
+    auto t_read = t_opened;
 
     DicomSource src;
     if (!src.open(result.input_path.c_str())) {
-        result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t0).count();
+        result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t_start).count();
         return result;
     }
+    auto t_parsed = Clock::now();
 
     // Multi-frame DICOM in PNG mode: route to all_frames path.
     // The encode task re-opens the file via encode_dicom_all_frames_to_png.
@@ -349,33 +366,53 @@ static PreDecodedFrame decode_dicom_to_frame(const fs::path& file,
         result.needs_all_frames = true;
         result.decode_ok        = true;
         result.output_path      = (outdir / file.stem()).string();
-        result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t0).count();
+        result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t_start).count();
         return result;
     }
 
     const int frame_idx = (cfg.frame >= 0) ? cfg.frame : 0;
-    if (frame_idx >= src.num_frames() || !src.load_frame(frame_idx)) {
-        result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t0).count();
+    if (frame_idx >= src.num_frames()) {
+        result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t_start).count();
         return result;
     }
 
-    result.info      = src.info_;
-    result.params    = src.params_;
-    result.pixels    = std::move(src.pixel_data_);  // zero-copy move
-    result.decode_ok = true;
+    result.info   = src.info();
+    result.params = *src.dicom_params();
 
-    const std::string ext = (cfg.format == ExportFormat::BMP) ? ".bmp" : ".png";
+    if (!src.load_frame(frame_idx)) {
+        result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t_start).count();
+        return result;
+    }
+    auto t_decoded = Clock::now();
+
+    result.pixels.resize((size_t)result.info.height * result.info.width * result.info.bpp);
+    src.read_strip(result.pixels.data(), result.info.height);
+
+    result.decode_ms       = std::chrono::duration_cast<Ms>(Clock::now() - t_start).count();
+    result.file_open_us    = std::chrono::duration_cast<std::chrono::microseconds>(t_opened - t_start).count();
+    result.file_read_us    = src.get_last_read_us();
+    result.dicom_parse_us  = std::chrono::duration_cast<std::chrono::microseconds>(t_parsed - t_opened).count() - result.file_read_us;
+    if (result.dicom_parse_us < 0) result.dicom_parse_us = 0;
+    result.pixel_decode_us = std::chrono::duration_cast<std::chrono::microseconds>(t_decoded - t_parsed).count();
+    result.decode_ok       = true;
+
+    const std::string ext = (cfg.format == ExportFormat::BMP) ? ".bmp" :
+                            (cfg.format == ExportFormat::JLS) ? ".jls" : ".png";
     result.output_path = (outdir / (file.stem().string() + ext)).string();
-    result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t0).count();
+    result.decode_ms = std::chrono::duration_cast<Ms>(Clock::now() - t_start).count();
     return result;
 }
 
 // ---------------------------------------------------------------------------
 // Encode a pre-decoded DICOM frame (called from enc_pool thread).
+// Populates tl.encode_us / tl.write_us / tl.jls_* timing fields.
 // ---------------------------------------------------------------------------
 static bool encode_predecoded_dicom(const PreDecodedFrame& frame,
-                                    const PipelineConfig& cfg)
+                                    const PipelineConfig& cfg,
+                                    FileTelemetry& tl)
 {
+    using Us = std::chrono::microseconds;
+
     if (frame.needs_all_frames) {
         std::error_code ec;
         fs::create_directories(frame.output_path, ec);
@@ -385,23 +422,13 @@ static bool encode_predecoded_dicom(const PreDecodedFrame& frame,
 
     // -----------------------------------------------------------------------
     // 16-bit grayscale DICOM → 8-bit pre-conversion fast path.
-    //
-    // Both BMP and PNG benefit: do the 16→8 conversion on the CPU here
-    // (Q15 fixed-point, ≈0.08 ms for 512×512) so the GPU never runs the
-    // dicom_preprocess_kernel inside run_pipeline(). For PNG, this fixes a
-    // -32% throughput regression (≈6 ms/file wasted GPU preprocessing).
-    //
-    // suppress_dicom_ = true tells MemoryDicomSource::dicom_params() to
-    // return nullptr, which skips the GPU DICOM kernel unconditionally.
     // -----------------------------------------------------------------------
     if (frame.info.channels == 1 && frame.info.bits_per_sample == 16) {
         const size_t pc = (size_t)frame.info.width * frame.info.height;
         std::vector<uint8_t> px8(pc);
 
-        // Fast path: Q15 fixed-point (SSE2-vectorizable, ~0.08 ms at 512×512)
         if (!try_apply_linear_window(frame.pixels.data(), px8.data(),
                                      (int)pc, frame.params)) {
-            // Fallback: shared LUT (built once per unique params, L3-resident)
             int shift; uint16_t mask16;
             auto lut_ref = get_or_build_shared_lut(frame.params, shift, mask16);
             apply_dicom16_lut(frame.pixels.data(), px8.data(), pc,
@@ -414,25 +441,156 @@ static bool encode_predecoded_dicom(const PreDecodedFrame& frame,
         src8.info_.bpp             = 1;
         src8.params_               = frame.params;
         src8.pixels_               = px8.data();
-        src8.suppress_dicom_       = true;  // GPU preprocessing kernel must NOT run
+        src8.suppress_dicom_       = true;
 
-        if (cfg.format == ExportFormat::BMP)
-            return encode_source_to_bmp(src8, frame.output_path.c_str());
+        if (cfg.format == ExportFormat::JLS) {
+            if (cfg.use_gpu_jls) {
+                // GPU JPEG-LS pipeline (G1–G5)
+                static thread_local GpuJlsContext* tl_jls_ctx = nullptr;
+                if (!tl_jls_ctx) {
+                    const GpuJlsMode jls_mode = cfg.use_gpu_jls_carry
+                        ? GpuJlsMode::ROW_CARRY
+                        : cfg.use_gpu_jls_cpu_rm
+                            ? GpuJlsMode::CPU_RM
+                            : GpuJlsMode::ROW_RESET;
+                    tl_jls_ctx = gpu_jls_create(frame.info.width, frame.info.height, jls_mode);
+                }
+                const bool ok = gpu_jls_encode(tl_jls_ctx,
+                                               px8.data(),
+                                               (int)frame.info.width, (int)frame.info.height,
+                                               frame.output_path.c_str());
+                // Collect per-phase GPU JLS timings
+                const GpuJlsTimings jt = gpu_jls_get_timings(tl_jls_ctx);
+                tl.jls_h2d_us      = (long long)jt.h2d_us;
+                tl.jls_g1_us       = (long long)jt.g1_us;
+                tl.jls_g2_us       = (long long)jt.g2_us;
+                tl.jls_g3_us       = (long long)jt.g3_us;
+                tl.jls_g4_us       = (long long)jt.g4_us;
+                tl.jls_g5_us       = (long long)jt.g5_us;
+                tl.jls_d2h_us      = (long long)jt.d2h_us;
+                tl.jls_cpu_wrap_us = (long long)jt.cpu_wrap_us;
+                return ok;
+            }
+            // CPU CharLS reference path — time encode and write separately
+            auto t0_enc = Clock::now();
+            uint8_t* jls_buf = nullptr;
+            const size_t written = jls_encode_gray8(
+                px8.data(), (int)frame.info.width, (int)frame.info.height, &jls_buf);
+            auto t1_enc = Clock::now();
+            if (written == 0) return false;
+            FILE* f = fopen(frame.output_path.c_str(), "wb");
+            if (!f) { delete[] jls_buf; return false; }
+            auto t0_write = Clock::now();
+            fwrite(jls_buf, 1, written, f);
+            fclose(f);
+            auto t1_write = Clock::now();
+            delete[] jls_buf;
+            tl.encode_us = std::chrono::duration_cast<Us>(t1_enc   - t0_enc  ).count();
+            tl.write_us  = std::chrono::duration_cast<Us>(t1_write - t0_write).count();
+            return true;
+        }
+        if (cfg.format == ExportFormat::BMP) {
+            if (cfg.use_gpu_bmp) {
+                // GPU path: H2D → window/level kernel → D2H → CPU BMP write
+                static thread_local GpuBmpContext* tl_bmp_ctx = nullptr;
+                if (!tl_bmp_ctx)
+                    tl_bmp_ctx = gpu_bmp_create((int)pc);
+
+                const uint16_t* px16 =
+                    reinterpret_cast<const uint16_t*>(frame.pixels.data());
+                const uint8_t* out8 =
+                    gpu_bmp_process(tl_bmp_ctx, px16,
+                                    (int)frame.info.width, (int)frame.info.height,
+                                    frame.params);
+                if (!out8) return false;
+
+                // Collect GPU timings before the write (next call invalidates them)
+                const GpuBmpTimings bt = gpu_bmp_get_timings(tl_bmp_ctx);
+                tl.bmp_h2d_us    = (long long)bt.h2d_us;
+                tl.bmp_kernel_us = (long long)bt.kernel_us;
+                tl.bmp_d2h_us    = (long long)bt.d2h_us;
+
+                // CPU: assemble MemoryDicomSource and write BMP
+                MemoryDicomSource src8_gpu;
+                src8_gpu.info_                 = frame.info;
+                src8_gpu.info_.bits_per_sample = 8;
+                src8_gpu.info_.bpp             = 1;
+                src8_gpu.params_               = frame.params;
+                src8_gpu.pixels_               = out8;
+                src8_gpu.suppress_dicom_       = true;
+
+                auto t0 = Clock::now();
+                const bool ok = encode_source_to_bmp(src8_gpu, frame.output_path.c_str());
+                auto t1 = Clock::now();
+                tl.write_us = std::chrono::duration_cast<Us>(t1 - t0).count();
+                return ok;
+            }
+            // CPU path: LUT conversion then write (existing behaviour)
+            auto t0 = Clock::now();
+            const bool ok = encode_source_to_bmp(src8, frame.output_path.c_str());
+            auto t1 = Clock::now();
+            tl.encode_us = std::chrono::duration_cast<Us>(t1 - t0).count();
+            tl.write_us  = tl.encode_us;   // BMP write is embedded in the encode call
+            return ok;
+        }
+        // PNG — GPU path stages are accumulated directly by run_one_modern();
+        // CPU path needs its own timing.
+        if (!cfg.use_gpu_deflate) {
+            auto t0 = Clock::now();
+            const bool ok = encode_source_to_png(src8, frame.output_path.c_str(), cfg);
+            auto t1 = Clock::now();
+            tl.encode_us = std::chrono::duration_cast<Us>(t1 - t0).count();
+            tl.write_us  = tl.encode_us;
+            return ok;
+        }
         return encode_source_to_png(src8, frame.output_path.c_str(), cfg);
     }
 
     // -----------------------------------------------------------------------
     // Non-16-bit or multi-channel: pass raw pixels through as-is.
-    // dicom_params() is non-null → GPU DICOM kernel runs inside run_pipeline().
-    // This path covers 8-bit DICOM, RGB DICOM, and any future formats.
     // -----------------------------------------------------------------------
     MemoryDicomSource src;
     src.info_   = frame.info;
     src.params_ = frame.params;
     src.pixels_ = frame.pixels.data();
 
-    if (cfg.format == ExportFormat::BMP)
-        return encode_source_to_bmp(src, frame.output_path.c_str());
+    if (cfg.format == ExportFormat::JLS && frame.info.channels == 1
+            && frame.info.bits_per_sample == 8) {
+        auto t0_enc = Clock::now();
+        uint8_t* jls_buf = nullptr;
+        const size_t written = jls_encode_gray8(
+            frame.pixels.data(), (int)frame.info.width, (int)frame.info.height,
+            &jls_buf);
+        auto t1_enc = Clock::now();
+        if (written == 0) return false;
+        FILE* f = fopen(frame.output_path.c_str(), "wb");
+        if (!f) { delete[] jls_buf; return false; }
+        auto t0_write = Clock::now();
+        fwrite(jls_buf, 1, written, f);
+        fclose(f);
+        auto t1_write = Clock::now();
+        delete[] jls_buf;
+        tl.encode_us = std::chrono::duration_cast<Us>(t1_enc   - t0_enc  ).count();
+        tl.write_us  = std::chrono::duration_cast<Us>(t1_write - t0_write).count();
+        return true;
+    }
+    if (cfg.format == ExportFormat::BMP) {
+        auto t0 = Clock::now();
+        const bool ok = encode_source_to_bmp(src, frame.output_path.c_str());
+        auto t1 = Clock::now();
+        tl.encode_us = std::chrono::duration_cast<Us>(t1 - t0).count();
+        tl.write_us  = tl.encode_us;
+        return ok;
+    }
+    // PNG (non-16-bit)
+    if (!cfg.use_gpu_deflate) {
+        auto t0 = Clock::now();
+        const bool ok = encode_source_to_png(src, frame.output_path.c_str(), cfg);
+        auto t1 = Clock::now();
+        tl.encode_us = std::chrono::duration_cast<Us>(t1 - t0).count();
+        tl.write_us  = tl.encode_us;
+        return ok;
+    }
     return encode_source_to_png(src, frame.output_path.c_str(), cfg);
 }
 
@@ -529,15 +687,17 @@ bool encode_folder(const char*           input_dir,
 
     const int   total          = (int)files.size();
     const bool  bmp_mode       = (cfg.format == ExportFormat::BMP);
-    const char* fmt_name       = bmp_mode ? "BMP" : "PNG";
-    const bool  use_gpu_summary = (cfg.use_gpu_deflate && !bmp_mode);
+    const char* fmt_name       = (cfg.format == ExportFormat::BMP) ? "BMP" : (cfg.format == ExportFormat::JLS ? "JLS" : "PNG");
+    // GPU telemetry fields (H2D, LZ77, deflate, etc.) are only populated by the
+    // PNG + --gpu-deflate path. Printing the GPU summary for BMP or JLS would
+    // show "GPU Total = 0 ms" and "Pipeline Type = GPU Resident" — both wrong.
+    const bool  use_gpu_summary = (cfg.format == ExportFormat::PNG && cfg.use_gpu_deflate);
 
     fprintf(stdout, "Batch: %d file(s), %d worker(s), format=%s%s\n",
             total, workers, fmt_name,
             batch_cfg.batch_verbose ? "  [--batch-verbose: per-file times shown]" : "");
 
-    if (use_gpu_summary)
-        pipeline_reset_gpu_batch_stats();
+    pipeline_reset_gpu_batch_stats();
 
     s_next_worker_id.store(0);
 
@@ -561,6 +721,19 @@ bool encode_folder(const char*           input_dir,
     results.reserve(files.size());
 
     ThreadPool encode_pool(workers);
+
+    // Pre-warm GPU BMP contexts: force CUDA context creation on each encode
+    // worker thread before the batch starts.  Without this, the first file on
+    // each thread triggers ~50-200 ms CUDA driver init, causing per-file spikes
+    // that inflate wall time by (workers × init_ms) / pipeline_overlap.
+    if (cfg.use_gpu_bmp && cfg.format == ExportFormat::BMP) {
+        std::vector<std::future<bool>> wfuts;
+        wfuts.reserve(workers);
+        for (int w = 0; w < workers; w++)
+            wfuts.push_back(encode_pool.submit([](){ gpu_bmp_warmup_thread(); return true; }));
+        for (auto& f : wfuts) f.get();
+    }
+
     auto batch_start = Clock::now();
 
     // -----------------------------------------------------------------
@@ -590,22 +763,28 @@ bool encode_folder(const char*           input_dir,
                     return FileResult{"??", false, 0, wid};
                 }
 
+                // Build FileTelemetry for this file; encode_predecoded_dicom
+                // fills in the format-specific encode/write/jls_* fields.
+                FileTelemetry tl;
+                tl.file_open_us    = frame.file_open_us;
+                tl.file_read_us    = frame.file_read_us;
+                tl.dicom_parse_us  = frame.dicom_parse_us;
+                tl.pixel_decode_us = frame.pixel_decode_us;
+
                 auto enc_t0 = Clock::now();
                 bool ok = false;
                 if (!frame.decode_ok) {
                     fprintf(stderr, "[batch] Decode failed: %s\n",
                             frame.input_path.c_str());
                 } else {
-                    ok = encode_predecoded_dicom(frame, cfg);
+                    ok = encode_predecoded_dicom(frame, cfg, tl);
                 }
                 auto enc_t1 = Clock::now();
                 const long long enc_ms =
                     std::chrono::duration_cast<Ms>(enc_t1 - enc_t0).count();
 
-                // Report decode + encode time to GPU batch stats accumulator.
-                if (use_gpu_summary)
-                    pipeline_record_file_times(frame.decode_ms,
-                                               frame.decode_ms + enc_ms);
+                tl.total_ms = frame.decode_ms + enc_ms;
+                pipeline_record_file_times(tl);
 
                 const long long total_ms = frame.decode_ms + enc_ms;
                 const int n = ++done_count;
@@ -706,11 +885,21 @@ bool encode_folder(const char*           input_dir,
                     "Pipeline    : BMP fast path  "
                     "(D2 decode-ahead: %d dec + %d enc threads)\n",
                     n_dec, workers);
-        else if (!use_gpu_summary)
+        else if (use_gpu_summary)
             fprintf(stdout,
-                    "Pipeline    : PNG CPU-deflate  "
+                    "Pipeline    : PNG GPU deflate  "
                     "(D2 decode-ahead: %d dec + %d enc threads)\n",
                     n_dec, workers);
+        else if (cfg.use_gpu_jls)
+            fprintf(stdout,
+                    "Pipeline    : JLS GPU (G1-G5 CUDA)  "
+                    "(D2 decode-ahead: %d dec + %d enc threads)\n",
+                    n_dec, workers);
+        else
+            fprintf(stdout,
+                    "Pipeline    : %s CPU path  "
+                    "(D2 decode-ahead: %d dec + %d enc threads)\n",
+                    fmt_name, n_dec, workers);
     }
 
     if (failed > 0) {
@@ -721,12 +910,15 @@ bool encode_folder(const char*           input_dir,
                         r.name.c_str(), r.ms);
     }
 
-    // GPU deflate breakdown only relevant for PNG + --gpu-deflate.
-    // BMP has no GPU deflate; skip to avoid printing all-zero stats.
-    if (use_gpu_summary)
-        pipeline_print_gpu_batch_summary(total, succeeded,
-                                         (double)batch_ms / 1000.0,
-                                         sum_ms, workers);
+    // K2–K6: Universal telemetry — always print for all formats.
+    pipeline_print_batch_summary(total, succeeded,
+                                 (double)batch_ms / 1000.0,
+                                 sum_ms, workers,
+                                 cfg.format,
+                                 cfg.use_gpu_deflate,
+                                 cfg.use_gpu_jls,
+                                 cfg.use_gpu_jls_cpu_rm,
+                                 cfg.use_gpu_bmp);
 
     return (failed == 0);
 }

@@ -491,6 +491,7 @@ struct ModernPipelineStats {
     std::atomic<long long> adler_ms      {0};
     std::atomic<long long> assemble_ms   {0};  // gpu_png_assemble_idat_chunk wall time
     std::atomic<long long> write_ms      {0};
+    std::atomic<long long> file_flush_us {0};
     std::atomic<int>       strip_count   {0};
 
     // GPU filter sub-phases (microseconds, from CUDA Events)
@@ -540,7 +541,15 @@ struct GpuBatchAccum {
     // file_total_ms: encode_*_to_png() entry → return, includes DICOM decode.
     // Accumulated via pipeline_record_file_times().
     std::atomic<long long> file_total_ms      {0};
-    // dicom_decode_ms: DicomSource::open() + load_frame() only.
+    std::atomic<long long> file_min_ms        {999999999LL};
+    std::atomic<long long> file_max_ms        {0};
+    // Input I/O breakdown
+    std::atomic<long long> file_open_us       {0};
+    std::atomic<long long> file_read_us       {0};
+    std::atomic<long long> dicom_parse_us     {0};
+    std::atomic<long long> pixel_decode_us    {0};
+
+    // Legacy accumulated decode time (optional, but keeping for compatibility if needed)
     std::atomic<long long> dicom_decode_ms    {0};
     std::atomic<long long> load_ms            {0};
     std::atomic<long long> gpu_ms             {0};
@@ -552,7 +561,9 @@ struct GpuBatchAccum {
     std::atomic<long long> gpu_h2d_us         {0};
     std::atomic<long long> gpu_d2h_us         {0};
     std::atomic<long long> deflate_lz77_us    {0};
-    std::atomic<long long> deflate_encode_us  {0};
+    std::atomic<long long> deflate_bitlen_us  {0};  // Huffman bit-length kernel (A/A')
+    std::atomic<long long> deflate_scan_us    {0};  // prefix-scan kernel (B)
+    std::atomic<long long> deflate_encode_us  {0};  // Huffman emit kernel (C+D+E)
     std::atomic<long long> deflate_sync_us    {0};
     std::atomic<long long> asm_crc_us         {0};
     std::atomic<long long> asm_d2h_us         {0};
@@ -561,6 +572,32 @@ struct GpuBatchAccum {
     std::atomic<long long> lz77_matches       {0};
     std::atomic<long long> lz77_matched_bytes {0};
     std::atomic<long long> total_positions    {0};
+
+    // K4 / GPU Preprocessing breakdown
+    std::atomic<long long> gpu_window_level_us     {0};
+    std::atomic<long long> gpu_normalization_us    {0};
+    std::atomic<long long> gpu_pixel_conversion_us {0};
+
+    // Output breakdown
+    std::atomic<long long> file_flush_us           {0};
+
+    // K2: per-format encode/write timing (all non-PNG-GPU paths)
+    std::atomic<long long> encode_us         {0};  // CPU encode time
+    std::atomic<long long> write_us          {0};  // output file write time
+    // K2: GPU JLS per-phase accumulators
+    std::atomic<long long> jls_h2d_us        {0};
+    std::atomic<long long> jls_g1_us         {0};
+    std::atomic<long long> jls_g2_us         {0};  // G2 (ROW_RESET) or D2H residuals (CPU_RM)
+    std::atomic<long long> jls_g3_us         {0};
+    std::atomic<long long> jls_g4_us         {0};
+    std::atomic<long long> jls_g5_us         {0};
+    std::atomic<long long> jls_d2h_us        {0};
+    std::atomic<long long> jls_cpu_wrap_us   {0};  // byte-stuff+write (ROW_RESET) / encode+write (CPU_RM)
+    // K2-BMP: GPU BMP per-phase accumulators (use_gpu_bmp paths only)
+    // File write time is captured in the existing write_us accumulator above.
+    std::atomic<long long> bmp_h2d_us        {0};  // H2D pixel transfer
+    std::atomic<long long> bmp_kernel_us     {0};  // window/level + 16→8 kernel
+    std::atomic<long long> bmp_d2h_us        {0};  // D2H 8-bit output
 };
 static GpuBatchAccum g_batch;
 
@@ -964,7 +1001,10 @@ static bool run_one_modern(
     }
 
     auto t_wall_end = Clock::now();
+    auto t_flush_0 = Clock::now();
     fclose(f);
+    auto t_flush_1 = Clock::now();
+    stats.file_flush_us += std::chrono::duration_cast<std::chrono::microseconds>(t_flush_1 - t_flush_0).count();
     auto t_abs_end = std::chrono::system_clock::now();
 
     if (!ok) {
@@ -975,10 +1015,13 @@ static bool run_one_modern(
     const double wall_ms_total = (double)std::chrono::duration_cast<std::chrono::microseconds>(
         t_wall_end - t_wall_start).count() / 1000.0;
 
-    // Accumulate into the global batch stats (thread-safe via atomics).
+    // Accumulate GPU sub-phase stats into global batch accumulators (thread-safe).
+    // NOTE: g_batch.files / file_total_ms / file_min_ms / file_max_ms are owned
+    // exclusively by pipeline_record_file_times() so they are NOT touched here.
+    // Incrementing files here caused double-counting when batch_processor also
+    // calls pipeline_record_file_times() for the same image. (K1.5 fix)
     {
         LzStats lzs = gpu_deflate_lz_stats(gdef);
-        g_batch.files             .fetch_add(1);
         g_batch.pipeline_wall_ms  .fetch_add((long long)wall_ms_total);
         g_batch.load_ms           .fetch_add(stats.load_ms.load());
         g_batch.gpu_ms            .fetch_add(stats.gpu_ms.load());
@@ -993,6 +1036,8 @@ static bool run_one_modern(
         g_batch.gpu_h2d_us        .fetch_add(stats.gpu_h2d_us.load());
         g_batch.gpu_d2h_us        .fetch_add(stats.gpu_d2h_us.load());
         g_batch.deflate_lz77_us   .fetch_add(stats.deflate_lz77_us.load());
+        g_batch.deflate_bitlen_us .fetch_add(stats.deflate_bitlen_us.load());
+        g_batch.deflate_scan_us   .fetch_add(stats.deflate_scan_us.load());
         g_batch.deflate_encode_us .fetch_add(stats.deflate_encode_us.load());
         g_batch.deflate_sync_us   .fetch_add(stats.deflate_sync_us.load());
         g_batch.asm_crc_us        .fetch_add(stats.assemble_crc_us.load());
@@ -1003,6 +1048,7 @@ static bool run_one_modern(
         g_batch.lz77_matches      .fetch_add((long long)lzs.matches_found);
         g_batch.lz77_matched_bytes.fetch_add((long long)lzs.matched_bytes);
         g_batch.total_positions   .fetch_add((long long)lzs.total_positions);
+        g_batch.file_flush_us     .fetch_add(stats.file_flush_us.load());
     }
 
     if (print_report) {
@@ -1295,6 +1341,12 @@ void pipeline_reset_gpu_batch_stats()
     g_batch.files             .store(0);
     g_batch.pipeline_wall_ms  .store(0);
     g_batch.file_total_ms     .store(0);
+    g_batch.file_min_ms       .store(999999999LL);
+    g_batch.file_max_ms       .store(0);
+    g_batch.file_open_us      .store(0);
+    g_batch.file_read_us      .store(0);
+    g_batch.dicom_parse_us    .store(0);
+    g_batch.pixel_decode_us   .store(0);
     g_batch.dicom_decode_ms   .store(0);
     g_batch.load_ms           .store(0);
     g_batch.gpu_ms            .store(0);
@@ -1305,6 +1357,8 @@ void pipeline_reset_gpu_batch_stats()
     g_batch.gpu_h2d_us        .store(0);
     g_batch.gpu_d2h_us        .store(0);
     g_batch.deflate_lz77_us   .store(0);
+    g_batch.deflate_bitlen_us .store(0);
+    g_batch.deflate_scan_us   .store(0);
     g_batch.deflate_encode_us .store(0);
     g_batch.deflate_sync_us   .store(0);
     g_batch.asm_crc_us        .store(0);
@@ -1314,199 +1368,335 @@ void pipeline_reset_gpu_batch_stats()
     g_batch.lz77_matches      .store(0);
     g_batch.lz77_matched_bytes.store(0);
     g_batch.total_positions   .store(0);
+    g_batch.gpu_window_level_us    .store(0);
+    g_batch.gpu_normalization_us   .store(0);
+    g_batch.gpu_pixel_conversion_us.store(0);
+    g_batch.file_flush_us          .store(0);
+    g_batch.encode_us              .store(0);
+    g_batch.write_us               .store(0);
+    g_batch.jls_h2d_us             .store(0);
+    g_batch.jls_g1_us              .store(0);
+    g_batch.jls_g2_us              .store(0);
+    g_batch.jls_g3_us              .store(0);
+    g_batch.jls_g4_us              .store(0);
+    g_batch.jls_g5_us              .store(0);
+    g_batch.jls_d2h_us             .store(0);
+    g_batch.jls_cpu_wrap_us        .store(0);
+    g_batch.bmp_h2d_us             .store(0);
+    g_batch.bmp_kernel_us          .store(0);
+    g_batch.bmp_d2h_us             .store(0);
 }
 
-void pipeline_record_file_times(long long dicom_ms, long long total_ms)
+void pipeline_record_file_times(const FileTelemetry& t)
 {
-    g_batch.dicom_decode_ms.fetch_add(dicom_ms);
-    g_batch.file_total_ms  .fetch_add(total_ms);
+    g_batch.files.fetch_add(1);
+    g_batch.file_open_us      .fetch_add(t.file_open_us);
+    g_batch.file_read_us      .fetch_add(t.file_read_us);
+    g_batch.dicom_parse_us    .fetch_add(t.dicom_parse_us);
+    g_batch.pixel_decode_us   .fetch_add(t.pixel_decode_us);
+    g_batch.encode_us         .fetch_add(t.encode_us);
+    g_batch.write_us          .fetch_add(t.write_us);
+    g_batch.jls_h2d_us        .fetch_add(t.jls_h2d_us);
+    g_batch.jls_g1_us         .fetch_add(t.jls_g1_us);
+    g_batch.jls_g2_us         .fetch_add(t.jls_g2_us);
+    g_batch.jls_g3_us         .fetch_add(t.jls_g3_us);
+    g_batch.jls_g4_us         .fetch_add(t.jls_g4_us);
+    g_batch.jls_g5_us         .fetch_add(t.jls_g5_us);
+    g_batch.jls_d2h_us        .fetch_add(t.jls_d2h_us);
+    g_batch.jls_cpu_wrap_us   .fetch_add(t.jls_cpu_wrap_us);
+    g_batch.bmp_h2d_us        .fetch_add(t.bmp_h2d_us);
+    g_batch.bmp_kernel_us     .fetch_add(t.bmp_kernel_us);
+    g_batch.bmp_d2h_us        .fetch_add(t.bmp_d2h_us);
+    g_batch.file_total_ms     .fetch_add(t.total_ms);
+
+    long long current_min = g_batch.file_min_ms.load();
+    while (t.total_ms < current_min && !g_batch.file_min_ms.compare_exchange_weak(current_min, t.total_ms)) {}
+
+    long long current_max = g_batch.file_max_ms.load();
+    while (t.total_ms > current_max && !g_batch.file_max_ms.compare_exchange_weak(current_max, t.total_ms)) {}
 }
 
-void pipeline_print_gpu_batch_summary(int total_files, int succeeded,
-                                      double total_wall_s,
-                                      long long sum_file_batch_ms,
-                                      int num_workers)
+void pipeline_print_batch_summary(int total_files, int succeeded,
+                                  double total_wall_s,
+                                  long long sum_file_batch_ms,
+                                  int num_workers,
+                                  ExportFormat fmt,
+                                  bool use_gpu_deflate,
+                                  bool use_gpu_jls,
+                                  bool use_gpu_jls_cpu_rm,
+                                  bool use_gpu_bmp)
 {
     const int       files          = g_batch.files.load();
-    const long long pipeline_sum   = g_batch.pipeline_wall_ms.load();
     const long long file_total_sum = g_batch.file_total_ms.load();
-    const long long dicom_sum      = g_batch.dicom_decode_ms.load();
-    const long long load_ms        = g_batch.load_ms.load();
-    const long long gpu_ms         = g_batch.gpu_ms.load();
-    const long long deflate_ms     = g_batch.deflate_ms.load();
-    const long long assemble_ms    = g_batch.assemble_ms.load();
-    const long long write_ms_v     = g_batch.write_ms.load();
-    const long long queue_wait_sum = g_batch.queue_wait_ms.load();
-    const long long h2d_us         = g_batch.gpu_h2d_us.load();
-    const long long d2h_wasted_us  = g_batch.gpu_d2h_us.load();
-    const long long lz77_us        = g_batch.deflate_lz77_us.load();
-    const long long encode_us      = g_batch.deflate_encode_us.load();
-    const long long sync_us        = g_batch.deflate_sync_us.load();
-    const long long crc_us         = g_batch.asm_crc_us.load();
-    const long long asm_d2h_us_v   = g_batch.asm_d2h_us.load();
-    const long long comp_bytes     = g_batch.compressed_bytes.load();
-    const long long raw_bytes      = g_batch.raw_bytes.load();
-    const long long lz_matches     = g_batch.lz77_matches.load();
-    const long long lz_matched_b   = g_batch.lz77_matched_bytes.load();
-    const long long lz_total_pos   = g_batch.total_positions.load();
+    const long long file_min_ms    = g_batch.file_min_ms.load();
+    const long long file_max_ms    = g_batch.file_max_ms.load();
 
-    const double total_wall_ms     = total_wall_s * 1000.0;
-    const double fps               = (total_wall_s > 0) ? (double)total_files / total_wall_s : 0.0;
+    // ── Load all accumulators ──────────────────────────────────────────────
+    // Input I/O (decode workers)
+    const double file_open_ms    = g_batch.file_open_us.load()    / 1000.0;
+    const double file_read_ms    = g_batch.file_read_us.load()    / 1000.0;
+    const double dicom_parse_ms  = g_batch.dicom_parse_us.load()  / 1000.0;
+    const double pixel_decode_ms = g_batch.pixel_decode_us.load() / 1000.0;
+    const double input_total_ms  = file_open_ms + file_read_ms + dicom_parse_ms + pixel_decode_ms;
 
-    // True per-file averages — what each file actually took end-to-end.
-    // file_total_ms covers encode_*_to_png() entry → return (DICOM decode + pipeline).
-    // pipeline_wall_ms is run_one_modern() only (excludes DICOM decode).
-    const double avg_file_total_ms = (files > 0) ? (double)file_total_sum / files : 0.0;
-    const double avg_dicom_ms      = (files > 0) ? (double)dicom_sum      / files : 0.0;
-    const double avg_pipeline_ms   = (files > 0) ? (double)pipeline_sum   / files : 0.0;
-    const double avg_queue_wait_ms = (files > 0) ? (double)queue_wait_sum / files : 0.0;
+    // CPU encode/write (BMP CPU, JLS CPU, PNG CPU)
+    const double encode_ms    = g_batch.encode_us.load() / 1000.0;
+    const double write_ms     = g_batch.write_us.load()  / 1000.0;
 
-    // Stage averages (concurrent, do not sum to wall time)
-    const double avg_load_ms     = (files > 0) ? (double)load_ms    / files : 0.0;
-    const double avg_gpu_ms      = (files > 0) ? (double)gpu_ms     / files : 0.0;
-    const double avg_deflate_ms  = (files > 0) ? (double)deflate_ms / files : 0.0;
-    const double avg_assemble_ms = (files > 0) ? (double)assemble_ms/ files : 0.0;
-    const double avg_write_ms    = (files > 0) ? (double)write_ms_v / files : 0.0;
+    // GPU JLS phases
+    const double jls_h2d_ms      = g_batch.jls_h2d_us.load()      / 1000.0;
+    const double jls_g1_ms       = g_batch.jls_g1_us.load()       / 1000.0;
+    const double jls_g2_ms       = g_batch.jls_g2_us.load()       / 1000.0;
+    const double jls_g3_ms       = g_batch.jls_g3_us.load()       / 1000.0;
+    const double jls_g4_ms       = g_batch.jls_g4_us.load()       / 1000.0;
+    const double jls_g5_ms       = g_batch.jls_g5_us.load()       / 1000.0;
+    const double jls_d2h_ms      = g_batch.jls_d2h_us.load()      / 1000.0;
+    const double jls_cpu_wrap_ms = g_batch.jls_cpu_wrap_us.load() / 1000.0;
 
-    const double avg_h2d_ms      = (files > 0) ? (double)(h2d_us / 1000LL)        / files : 0.0;
-    const double avg_d2h_wst_ms  = (files > 0) ? (double)(d2h_wasted_us / 1000LL) / files : 0.0;
-    const double avg_lz77_ms     = (files > 0) ? (double)(lz77_us / 1000LL)       / files : 0.0;
-    const double avg_encode_ms   = (files > 0) ? (double)(encode_us / 1000LL)     / files : 0.0;
-    const double avg_sync_ms     = (files > 0) ? (double)(sync_us / 1000LL)       / files : 0.0;
-    const double avg_crc_ms      = (files > 0) ? (double)(crc_us / 1000LL)        / files : 0.0;
-    const double avg_asmd2h_ms   = (files > 0) ? (double)(asm_d2h_us_v / 1000LL)  / files : 0.0;
+    // GPU BMP phases
+    const double bmp_h2d_ms    = g_batch.bmp_h2d_us.load()    / 1000.0;
+    const double bmp_kernel_ms = g_batch.bmp_kernel_us.load()  / 1000.0;
+    const double bmp_d2h_ms    = g_batch.bmp_d2h_us.load()    / 1000.0;
+    const double bmp_gpu_ms    = bmp_h2d_ms + bmp_kernel_ms + bmp_d2h_ms;
 
-    const double total_raw_gb    = (double)raw_bytes  / (1024.0*1024.0*1024.0);
-    const double total_comp_gb   = (double)comp_bytes / (1024.0*1024.0*1024.0);
-    const double overall_ratio   = (raw_bytes > 0) ? (double)comp_bytes / (double)raw_bytes : 0.0;
+    // PNG GPU phases (accumulated directly by run_one_modern)
+    const double png_h2d_ms     = g_batch.gpu_h2d_us.load()   / 1000.0;
+    const double png_filter_ms  = g_batch.gpu_ms.load();
+    const double png_lz77_ms    = g_batch.deflate_lz77_us.load()  / 1000.0;
+    const double png_deflate_ms = (g_batch.deflate_bitlen_us.load() + g_batch.deflate_scan_us.load()
+                                 + g_batch.deflate_encode_us.load() + g_batch.deflate_sync_us.load()) / 1000.0;
+    const double png_asm_ms     = g_batch.asm_crc_us.load() / 1000.0 + g_batch.assemble_ms.load();
+    const double png_d2h_ms     = g_batch.asm_d2h_us.load() / 1000.0;
+    const double png_write_ms   = g_batch.write_ms.load();
+    const double png_flush_ms   = g_batch.file_flush_us.load() / 1000.0;
 
-    const double lz77_coverage   = (lz_total_pos > 0)
-        ? 100.0 * (double)lz_matched_b / (double)lz_total_pos : 0.0;
-    const double avg_match_len   = (lz_matches > 0)
-        ? (double)lz_matched_b / (double)lz_matches : 0.0;
+    // ── Derived per-format totals for wall-clock attribution ───────────────
+    // total_encode_ms: ALL time spent in encode workers (excluding output write
+    // for formats that separate them).
+    double total_encode_ms = 0.0;  // total encode+write time in encode workers
+    if (fmt == ExportFormat::BMP && !use_gpu_bmp) {
+        total_encode_ms = encode_ms;                    // convert+write combined
+    } else if (fmt == ExportFormat::BMP && use_gpu_bmp) {
+        total_encode_ms = bmp_gpu_ms + write_ms;        // H2D+kernel+D2H + file write
+    } else if (fmt == ExportFormat::JLS && !use_gpu_jls) {
+        total_encode_ms = encode_ms + write_ms;
+    } else if (fmt == ExportFormat::JLS && use_gpu_jls && !use_gpu_jls_cpu_rm) {
+        total_encode_ms = jls_h2d_ms + jls_g1_ms + jls_g2_ms + jls_g3_ms
+                        + jls_g4_ms + jls_g5_ms + jls_d2h_ms + jls_cpu_wrap_ms;
+    } else if (fmt == ExportFormat::JLS && use_gpu_jls && use_gpu_jls_cpu_rm) {
+        total_encode_ms = jls_g1_ms + jls_g2_ms + jls_cpu_wrap_ms;
+    } else if (fmt == ExportFormat::PNG && !use_gpu_deflate) {
+        total_encode_ms = encode_ms;                    // filter+compress+write combined
+    } else {
+        // PNG GPU
+        total_encode_ms = png_h2d_ms + png_filter_ms + png_lz77_ms + png_deflate_ms
+                        + png_asm_ms + png_d2h_ms + png_write_ms + png_flush_ms;
+    }
 
-    for (int i = 0; i < 60; i++) fputc('=', stdout); fputc('\n', stdout);
-    fprintf(stdout, "GPU BATCH PERFORMANCE SUMMARY\n");
-    for (int i = 0; i < 60; i++) fputc('=', stdout); fputc('\n', stdout);
-    fprintf(stdout, "Files               : %d total  |  %d OK  |  %d failed\n",
+    // ── Wall-clock attribution (Objective C) ──────────────────────────────
+    // The D2 decode-ahead pipeline runs 2 independent worker pools:
+    //   decode pool (N workers): file open → DICOM decode
+    //   encode pool (N workers): encode → write
+    // Both pools run concurrently, so total available worker-time is 2N×wall.
+    // Each percentage = Σ stage time / (2×N×wall_ms).
+    const double total_wall_ms = total_wall_s * 1000.0;
+    const double budget_ms     = 2.0 * num_workers * total_wall_ms;
+    auto wall_pct = [&](double v) -> double {
+        return (budget_ms > 0) ? 100.0 * v / budget_ms : 0.0;
+    };
+    const double input_wpct  = wall_pct(input_total_ms);
+    const double encode_wpct = wall_pct(total_encode_ms);
+    const double sum_wpct    = input_wpct + encode_wpct;
+    const double idle_wpct   = (sum_wpct < 100.0) ? 100.0 - sum_wpct : 0.0;
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    const double fps         = (total_wall_s > 0) ? (double)total_files / total_wall_s : 0.0;
+    const double file_time_ms= (files > 0) ? (double)file_total_sum / files : 0.0;
+    auto avg = [&](double v) -> double { return (files > 0) ? v / files : 0.0; };
+
+    auto sep = [&]{ for (int i=0;i<62;i++) fputc('=',stdout); fputc('\n',stdout); };
+    auto sub = [&]{ fprintf(stdout,"  "); for (int i=0;i<58;i++) fputc('-',stdout); fputc('\n',stdout); };
+
+    // ── Pipeline label ────────────────────────────────────────────────────
+    const char* pipeline_name;
+    if      (fmt == ExportFormat::BMP && !use_gpu_bmp)                         pipeline_name = "BMP CPU  (D2 decode-ahead)";
+    else if (fmt == ExportFormat::BMP &&  use_gpu_bmp)                         pipeline_name = "BMP GPU  (W/L kernel, D2 decode-ahead)";
+    else if (fmt == ExportFormat::JLS && !use_gpu_jls)                         pipeline_name = "JLS CPU  (CharLS, D2 decode-ahead)";
+    else if (fmt == ExportFormat::JLS &&  use_gpu_jls && !use_gpu_jls_cpu_rm)  pipeline_name = "JLS GPU  (G1-G5 ROW_RESET, D2 decode-ahead)";
+    else if (fmt == ExportFormat::JLS &&  use_gpu_jls &&  use_gpu_jls_cpu_rm)  pipeline_name = "JLS GPU+CPU  (G1 GPU + CPU run-mode, D2 decode-ahead)";
+    else if (fmt == ExportFormat::PNG && !use_gpu_deflate)                     pipeline_name = "PNG CPU  (zlib, D2 decode-ahead)";
+    else                                                                        pipeline_name = "PNG GPU  (custom deflate, D2 decode-ahead)";
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 1: BATCH WALL CLOCK
+    // ══════════════════════════════════════════════════════════════════════
+    fprintf(stdout, "\n");
+    sep();
+    fprintf(stdout, "BATCH TELEMETRY — %s\n", pipeline_name);
+    sep();
+    fprintf(stdout, "  Files      : %d total  |  %d OK  |  %d failed\n",
             total_files, succeeded, total_files - succeeded);
-    fprintf(stdout, "GPU images tracked  : %d\n", files);
-    fprintf(stdout, "Batch wall time     : %.3f s\n", total_wall_s);
-    fprintf(stdout, "Throughput          : %.2f files/s\n", fps);
-    fprintf(stdout, "Avg pipeline time   : %.1f ms  (run_one_modern only; excludes DICOM decode)\n",
-            avg_pipeline_ms);
-    fprintf(stdout, "Avg file total      : %.1f ms  (DICOM decode + pipeline)\n",
-            avg_file_total_ms);
-    fprintf(stdout, "\nStage Averages (per file, concurrent -- do not sum to wall time):\n");
-    fprintf(stdout, "  Loader            : %.1f ms\n",  avg_load_ms);
-    fprintf(stdout, "  GPU Filter        : %.1f ms\n",  avg_gpu_ms);
-    fprintf(stdout, "  GPU Deflate       : %.1f ms\n",  avg_deflate_ms);
-    fprintf(stdout, "  PNG Assembly      : %.1f ms\n",  avg_assemble_ms);
-    fprintf(stdout, "  Writer            : %.1f ms\n",  avg_write_ms);
-    fprintf(stdout, "\nTransfer Averages (per file):\n");
-    fprintf(stdout, "  H2D (raw image)   : %.1f ms\n",  avg_h2d_ms);
-    fprintf(stdout, "  D2H (filter) [!]  : %.1f ms  (WASTED -- unused in modern path)\n",
-            avg_d2h_wst_ms);
-    fprintf(stdout, "  Assembly D2H      : %.1f ms  (PNG chunks → host)\n", avg_asmd2h_ms);
-    fprintf(stdout, "\nDeflate Sub-phase Averages (per file):\n");
-    fprintf(stdout, "  LZ77 kernel       : %.1f ms\n",  avg_lz77_ms);
-    fprintf(stdout, "  Encode kernels    : %.1f ms\n",  avg_encode_ms);
-    fprintf(stdout, "  Stream sync stall : %.1f ms\n",  avg_sync_ms);
-    fprintf(stdout, "  Assembly CRC      : %.1f ms\n",  avg_crc_ms);
-    fprintf(stdout, "\nCompression Totals:\n");
-    fprintf(stdout, "  Raw (filtered)    : %.3f GB\n",  total_raw_gb);
-    fprintf(stdout, "  Compressed        : %.3f GB\n",  total_comp_gb);
-    fprintf(stdout, "  Overall ratio     : %.3f\n",     overall_ratio);
-    if (lz_total_pos > 0) {
-        fprintf(stdout, "  LZ77 coverage     : %.1f%%  (%lld matches, avg len %.1f)\n",
-                lz77_coverage, (long long)lz_matches, avg_match_len);
+    fprintf(stdout, "  Workers    : %d decode + %d encode  (D2 pipeline)\n",
+            num_workers, num_workers);
+    fprintf(stdout, "  Wall Time  : %.0f ms  (%.3f s)\n", total_wall_ms, total_wall_s);
+    fprintf(stdout, "  Throughput : %.1f files/s\n", fps);
+    fprintf(stdout, "  Avg/Min/Max: %.2f ms  |  %lld ms  |  %lld ms  per file\n",
+            file_time_ms, (files > 0) ? file_min_ms : 0LL, file_max_ms);
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 2: AGGREGATE WORK  (Σ worker time — NOT wall-clock)
+    // ══════════════════════════════════════════════════════════════════════
+    fprintf(stdout, "\n");
+    sep();
+    fprintf(stdout, "AGGREGATE WORK  (Σ across %d workers × %d files — NOT wall-clock)\n",
+            num_workers, files);
+    sep();
+    fprintf(stdout, "  Input I/O  : %8.0f ms   avg %6.2f ms/file"
+                    "  (open+read+parse+decode)\n",
+            input_total_ms, avg(input_total_ms));
+    fprintf(stdout, "  Encode/Write:%8.0f ms   avg %6.2f ms/file"
+                    "  (all encode + file write)\n",
+            total_encode_ms, avg(total_encode_ms));
+    fprintf(stdout, "  Worker Sum : %8lld ms   (may exceed wall×workers — decode+encode overlap)\n",
+            (long long)(input_total_ms + total_encode_ms));
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 3: WALL-CLOCK ATTRIBUTION  (percentages sum to ~100%)
+    // ══════════════════════════════════════════════════════════════════════
+    fprintf(stdout, "\n");
+    sep();
+    fprintf(stdout, "WALL-CLOCK ATTRIBUTION\n");
+    sep();
+    fprintf(stdout, "  Budget : %.0f ms  (2 pools × %d workers × %.0f ms wall)\n",
+            budget_ms, num_workers, total_wall_ms);
+    fprintf(stdout, "  Input  : %5.1f%%   (decode pool: %.0f ms / %.0f ms)\n",
+            input_wpct, input_total_ms, budget_ms);
+    fprintf(stdout, "  Encode : %5.1f%%   (encode pool: %.0f ms / %.0f ms)\n",
+            encode_wpct, total_encode_ms, budget_ms);
+    fprintf(stdout, "  Idle   : %5.1f%%   (queue wait + OS scheduling overhead)\n",
+            idle_wpct);
+    sub();
+    fprintf(stdout, "  Check  : %5.1f%%   (≈100%% confirms attribution is valid)\n",
+            input_wpct + encode_wpct + idle_wpct);
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 4: INPUT I/O BREAKDOWN
+    // ══════════════════════════════════════════════════════════════════════
+    fprintf(stdout, "\n");
+    sep();
+    fprintf(stdout, "INPUT I/O BREAKDOWN  (Σ across %d files)\n", files);
+    sep();
+    fprintf(stdout, "  File Open      : %8.0f ms   avg %6.2f ms/file\n", file_open_ms,    avg(file_open_ms));
+    fprintf(stdout, "  File Read      : %8.0f ms   avg %6.2f ms/file\n", file_read_ms,    avg(file_read_ms));
+    fprintf(stdout, "  DICOM Parse    : %8.0f ms   avg %6.2f ms/file\n", dicom_parse_ms,  avg(dicom_parse_ms));
+    fprintf(stdout, "  Pixel Decode   : %8.0f ms   avg %6.2f ms/file\n", pixel_decode_ms, avg(pixel_decode_ms));
+    sub();
+    fprintf(stdout, "  Input Total    : %8.0f ms   avg %6.2f ms/file\n",
+            input_total_ms, avg(input_total_ms));
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 5: ENCODE/WRITE BREAKDOWN  (format-specific)
+    // ══════════════════════════════════════════════════════════════════════
+    fprintf(stdout, "\n");
+    sep();
+
+    if (fmt == ExportFormat::BMP && !use_gpu_bmp) {
+        fprintf(stdout, "ENCODE/WRITE BREAKDOWN — BMP CPU\n");
+        sep();
+        fprintf(stdout, "  BMP Convert+Write : %8.0f ms   avg %6.2f ms/file"
+                        "  (CPU LUT + fwrite, combined)\n",
+                encode_ms, avg(encode_ms));
+        sub();
+        fprintf(stdout, "  Total             : %8.0f ms   avg %6.2f ms/file\n",
+                encode_ms, avg(encode_ms));
+
+    } else if (fmt == ExportFormat::BMP && use_gpu_bmp) {
+        fprintf(stdout, "ENCODE/WRITE BREAKDOWN — BMP GPU\n");
+        sep();
+        fprintf(stdout, "  H2D Transfer      : %8.0f ms   avg %6.3f ms/file\n", bmp_h2d_ms,    avg(bmp_h2d_ms));
+        fprintf(stdout, "  Window/Level kern : %8.0f ms   avg %6.3f ms/file\n", bmp_kernel_ms, avg(bmp_kernel_ms));
+        fprintf(stdout, "  D2H Transfer      : %8.0f ms   avg %6.3f ms/file\n", bmp_d2h_ms,    avg(bmp_d2h_ms));
+        fprintf(stdout, "  BMP File Write    : %8.0f ms   avg %6.2f ms/file\n", write_ms,       avg(write_ms));
+        sub();
+        fprintf(stdout, "  Total             : %8.0f ms   avg %6.2f ms/file\n",
+                total_encode_ms, avg(total_encode_ms));
+
+    } else if (fmt == ExportFormat::JLS && !use_gpu_jls) {
+        fprintf(stdout, "ENCODE/WRITE BREAKDOWN — JLS CPU  (CharLS)\n");
+        sep();
+        fprintf(stdout, "  CharLS Encode : %8.0f ms   avg %6.2f ms/file\n", encode_ms, avg(encode_ms));
+        fprintf(stdout, "  File Write    : %8.0f ms   avg %6.2f ms/file\n", write_ms,  avg(write_ms));
+        sub();
+        fprintf(stdout, "  Total         : %8.0f ms   avg %6.2f ms/file\n",
+                total_encode_ms, avg(total_encode_ms));
+
+    } else if (fmt == ExportFormat::JLS && use_gpu_jls && !use_gpu_jls_cpu_rm) {
+        fprintf(stdout, "ENCODE/WRITE BREAKDOWN — JLS GPU  (G1-G5 ROW_RESET)\n");
+        sep();
+        fprintf(stdout, "  H2D Transfer  : %8.0f ms   avg %6.2f ms/file\n", jls_h2d_ms, avg(jls_h2d_ms));
+        fprintf(stdout, "  G1 LOCO-I     : %8.0f ms   avg %6.2f ms/file\n", jls_g1_ms,  avg(jls_g1_ms));
+        fprintf(stdout, "  G2 Golomb-k   : %8.0f ms   avg %6.2f ms/file   <- dominant kernel\n", jls_g2_ms, avg(jls_g2_ms));
+        fprintf(stdout, "  G3 Bit-Length : %8.0f ms   avg %6.2f ms/file\n", jls_g3_ms,  avg(jls_g3_ms));
+        fprintf(stdout, "  G4 Prefix Scan: %8.0f ms   avg %6.2f ms/file\n", jls_g4_ms,  avg(jls_g4_ms));
+        fprintf(stdout, "  G5 Bit-Emit   : %8.0f ms   avg %6.2f ms/file\n", jls_g5_ms,  avg(jls_g5_ms));
+        fprintf(stdout, "  D2H Bitstream : %8.0f ms   avg %6.2f ms/file\n", jls_d2h_ms, avg(jls_d2h_ms));
+        fprintf(stdout, "  CPU Wrap+Write: %8.0f ms   avg %6.2f ms/file\n", jls_cpu_wrap_ms, avg(jls_cpu_wrap_ms));
+        sub();
+        fprintf(stdout, "  Total         : %8.0f ms   avg %6.2f ms/file\n",
+                total_encode_ms, avg(total_encode_ms));
+
+    } else if (fmt == ExportFormat::JLS && use_gpu_jls && use_gpu_jls_cpu_rm) {
+        fprintf(stdout, "ENCODE/WRITE BREAKDOWN — JLS GPU+CPU  (CPU_RM)\n");
+        sep();
+        fprintf(stdout, "  G1 LOCO-I (GPU)  : %8.0f ms   avg %6.2f ms/file\n", jls_g1_ms,       avg(jls_g1_ms));
+        fprintf(stdout, "  D2H Residuals    : %8.0f ms   avg %6.2f ms/file\n", jls_g2_ms,       avg(jls_g2_ms));
+        fprintf(stdout, "  CPU Encode+Write : %8.0f ms   avg %6.2f ms/file   (run-mode + fwrite)\n",
+                jls_cpu_wrap_ms, avg(jls_cpu_wrap_ms));
+        sub();
+        fprintf(stdout, "  Total            : %8.0f ms   avg %6.2f ms/file\n",
+                total_encode_ms, avg(total_encode_ms));
+
+    } else if (fmt == ExportFormat::PNG && !use_gpu_deflate) {
+        fprintf(stdout, "ENCODE/WRITE BREAKDOWN — PNG CPU  (zlib)\n");
+        sep();
+        fprintf(stdout, "  Filter+Compress+Write : %8.0f ms   avg %6.2f ms/file   (combined)\n",
+                encode_ms, avg(encode_ms));
+        sub();
+        fprintf(stdout, "  Total                 : %8.0f ms   avg %6.2f ms/file\n",
+                total_encode_ms, avg(total_encode_ms));
+
+    } else {
+        // PNG GPU
+        fprintf(stdout, "ENCODE/WRITE BREAKDOWN — PNG GPU  (custom deflate)\n");
+        sep();
+        fprintf(stdout, "  H2D Transfer  : %8.0f ms   avg %6.2f ms/file\n", png_h2d_ms,     avg(png_h2d_ms));
+        if (png_filter_ms > 0)
+            fprintf(stdout, "  PNG Filter    : %8.0f ms   avg %6.2f ms/file\n", png_filter_ms,  avg(png_filter_ms));
+        if (png_lz77_ms > 0)
+            fprintf(stdout, "  LZ77 Match    : %8.0f ms   avg %6.2f ms/file\n", png_lz77_ms,    avg(png_lz77_ms));
+        if (png_deflate_ms > 0)
+            fprintf(stdout, "  Huffman+Scan  : %8.0f ms   avg %6.2f ms/file\n", png_deflate_ms, avg(png_deflate_ms));
+        if (png_asm_ms > 0)
+            fprintf(stdout, "  Assembly+CRC  : %8.0f ms   avg %6.2f ms/file\n", png_asm_ms,     avg(png_asm_ms));
+        fprintf(stdout, "  D2H Transfer  : %8.0f ms   avg %6.2f ms/file\n", png_d2h_ms,     avg(png_d2h_ms));
+        fprintf(stdout, "  File Write    : %8.0f ms   avg %6.2f ms/file\n", png_write_ms,   avg(png_write_ms));
+        if (png_flush_ms > 0)
+            fprintf(stdout, "  File Flush    : %8.0f ms   avg %6.2f ms/file\n", png_flush_ms,   avg(png_flush_ms));
+        sub();
+        fprintf(stdout, "  Total         : %8.0f ms   avg %6.2f ms/file\n",
+                total_encode_ms, avg(total_encode_ms));
     }
-    fprintf(stdout, "\nKey Bottlenecks (sum across all files):\n");
-    fprintf(stdout, "  Wasted filter D2H : %.1f ms total (%.1f ms/file)\n",
-            (double)(d2h_wasted_us / 1000LL), avg_d2h_wst_ms);
-    fprintf(stdout, "  LZ77 (3.1%% util)  : %.1f ms total (%.1f ms/file)\n",
-            (double)(lz77_us / 1000LL), avg_lz77_ms);
-    fprintf(stdout, "  CRC generation    : %.1f ms total (%.1f ms/file)\n",
-            (double)(crc_us / 1000LL), avg_crc_ms);
-    fprintf(stdout, "  Stream sync       : %.1f ms total (%.1f ms/file)\n",
-            (double)(sync_us / 1000LL), avg_sync_ms);
 
-    // =========================================================================
-    // TIMING CONSISTENCY REPORT
-    // Verifies that per-file timings reconcile with the observed batch wall time.
-    // All numbers below use sum_file_batch_ms (measured by batch_processor.cpp
-    // around each process_one_file() call) as the ground truth file total, which
-    // is independent of the GPU batch accumulator.
-    // =========================================================================
-    {
-        const double sum_file_ms     = (double)sum_file_batch_ms;
-        const double sum_internal_ms = (double)file_total_sum;    // encode_*_to_png scope
-        const double expected_par_ms = (num_workers > 0)
-            ? sum_file_ms / (double)num_workers : 0.0;
-        const double timing_error_ms = total_wall_ms - expected_par_ms;
-        const double timing_error_pct= (expected_par_ms > 0)
-            ? 100.0 * timing_error_ms / expected_par_ms : 0.0;
-        const double worker_util     = (num_workers > 0 && total_wall_ms > 0)
-            ? 100.0 * sum_file_ms / ((double)num_workers * total_wall_ms) : 0.0;
-
-        // Scope gap: difference between batch_processor's view of a file and
-        // the GPU pipeline's view.  Represents GPU context alloc, batch overhead,
-        // and any unmeasured phases.
-        const double scope_gap_ms    = (files > 0)
-            ? (sum_file_ms - sum_internal_ms) / files : 0.0;
-        const double avg_batch_ms    = (total_files > 0)
-            ? sum_file_ms / (double)total_files : 0.0;
-
-        fputc('\n', stdout);
-        for (int i = 0; i < 50; i++) fputc('=', stdout); fputc('\n', stdout);
-        fprintf(stdout, "TIMING CONSISTENCY REPORT\n");
-        for (int i = 0; i < 50; i++) fputc('=', stdout); fputc('\n', stdout);
-        fprintf(stdout, "Batch Wall Time        : %.0f ms\n", total_wall_ms);
-        fprintf(stdout, "Workers                : %d\n", num_workers);
-        fprintf(stdout, "Files Processed        : %d\n", total_files);
-        fputc('\n', stdout);
-        fprintf(stdout, "Avg File Total (batch) : %.0f ms  [batch_processor scope]\n",
-                avg_batch_ms);
-        fprintf(stdout, "Avg DICOM Decode       : %.0f ms  [open + load_frame]\n",
-                avg_dicom_ms);
-        fprintf(stdout, "Avg Pipeline           : %.0f ms  [run_one_modern scope]\n",
-                avg_pipeline_ms);
-        fprintf(stdout, "Avg Queue Wait         : %.0f ms  [inter-stage stalls inside pipeline]\n",
-                avg_queue_wait_ms);
-        fprintf(stdout, "Scope Gap (per file)   : %.0f ms  [batch overhead outside encode_*_to_png]\n",
-                scope_gap_ms);
-        fputc('\n', stdout);
-        fprintf(stdout, "Sum File Total         : %.0f ms\n", sum_file_ms);
-        fprintf(stdout, "Expected Parallel Time : %.0f ms  (%.0f ms / %d workers)\n",
-                expected_par_ms, sum_file_ms, num_workers);
-        fprintf(stdout, "Timing Error           : %+.0f ms  (%+.1f%%)  "
-                "[batch_wall - expected; load imbalance + scheduling]\n",
-                timing_error_ms, timing_error_pct);
-        fprintf(stdout, "Worker Utilization     : %.1f%%  (%.0f / (%d × %.0f))\n",
-                worker_util, sum_file_ms, num_workers, total_wall_ms);
-
-        // Validation verdict
-        const double abs_err_pct = (timing_error_pct < 0)
-            ? -timing_error_pct : timing_error_pct;
-        fputc('\n', stdout);
-        if (abs_err_pct <= 10.0)
-            fprintf(stdout, "Validation: PASS  (timing error %.1f%% <= 10%% threshold)\n",
-                    abs_err_pct);
-        else if (abs_err_pct <= 25.0)
-            fprintf(stdout, "Validation: WARN  (timing error %.1f%% > 10%%; "
-                    "acceptable if load is uneven)\n", abs_err_pct);
-        else
-            fprintf(stdout, "Validation: FAIL  (timing error %.1f%% > 25%%; "
-                    "likely a measurement scope bug)\n", abs_err_pct);
-    }
-    for (int i = 0; i < 60; i++) fputc('=', stdout); fputc('\n', stdout);
+    sep();
+    fprintf(stdout, "\n");
 }
 
 #else
 // Stubs so batch_processor.cpp links regardless of GPU_PNG_MODERN_DEFLATE.
 void pipeline_reset_gpu_batch_stats() {}
-void pipeline_record_file_times(long long, long long) {}
-void pipeline_print_gpu_batch_summary(int, int, double, long long, int) {}
+void pipeline_record_file_times(const FileTelemetry&) {}
+void pipeline_print_batch_summary(int, int, double, long long, int,
+                                  ExportFormat, bool, bool, bool, bool) {}
 #endif  // GPU_PNG_MODERN_DEFLATE
 
 // ---------------------------------------------------------------------------
@@ -1688,7 +1878,9 @@ bool encode_tiff_to_png(const char* input_path,
 #if defined(GPU_PNG_MODERN_DEFLATE)
     if (cfg.use_gpu_deflate) {
         long long total_ms = std::chrono::duration_cast<Ms>(t_file_end - t_file_start).count();
-        pipeline_record_file_times(0LL, total_ms);
+        FileTelemetry t;
+        t.total_ms = total_ms;
+        pipeline_record_file_times(t);
     }
 #endif
     return ok;
@@ -1713,7 +1905,9 @@ bool encode_raw_to_png(const char* input_path,
 #if defined(GPU_PNG_MODERN_DEFLATE)
     if (cfg.use_gpu_deflate) {
         long long total_ms = std::chrono::duration_cast<Ms>(t_file_end - t_file_start).count();
-        pipeline_record_file_times(0LL, total_ms);
+        FileTelemetry t;
+        t.total_ms = total_ms;
+        pipeline_record_file_times(t);
     }
 #endif
     return ok;
@@ -1751,7 +1945,10 @@ bool encode_dicom_to_png(const char* input_path,
     if (cfg.use_gpu_deflate) {
         long long dicom_ms = std::chrono::duration_cast<Ms>(t_decode_end - t_decode_start).count();
         long long total_ms = std::chrono::duration_cast<Ms>(t_file_end   - t_file_start  ).count();
-        pipeline_record_file_times(dicom_ms, total_ms);
+        FileTelemetry t;
+        t.total_ms = total_ms;
+        t.pixel_decode_us = dicom_ms * 1000;
+        pipeline_record_file_times(t);
     }
 #endif
     return ok;

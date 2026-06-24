@@ -143,6 +143,9 @@ set(SOURCES
     src/gpu_capability.cpp
     src/batch_processor.cpp
     src/file_type.cpp
+    src/jls_encoder.cpp
+    src/gpu_jls_backend.cu
+    src/gpu_bmp_backend.cu
 )
 
 # GPU CRC32, GPU Adler32, the custom GPU DEFLATE encoder, and GPU PNG chunk
@@ -170,6 +173,13 @@ target_include_directories(gpu_png_encoder PRIVATE
 
 target_compile_features(gpu_png_encoder PRIVATE cxx_std_17)
 
+find_library(DCMTK_CHARLS_LIB NAMES dcmtkcharls
+    PATHS "${CMAKE_SOURCE_DIR}/vcpkg_installed/x64-windows/lib"
+    NO_DEFAULT_PATH)
+if(NOT DCMTK_CHARLS_LIB)
+    message(FATAL_ERROR "dcmtkcharls.lib not found in vcpkg_installed/x64-windows/lib")
+endif()
+
 target_link_libraries(gpu_png_encoder PRIVATE
     PNG::PNG
     TIFF::TIFF
@@ -177,6 +187,7 @@ target_link_libraries(gpu_png_encoder PRIVATE
     libraw::raw_r
     dicom_lib       # includes DCMTK + OpenJPEG symbols; no INTERFACE flag leakage
     CUDA::cudart    # exposes cuda_runtime.h to plain .cpp TUs (gpu_capability.cpp)
+    ${DCMTK_CHARLS_LIB}
 )
 
 target_link_options(gpu_png_encoder PRIVATE /LTCG)

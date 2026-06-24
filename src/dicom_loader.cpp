@@ -33,6 +33,7 @@
 
 #include <dcmtk/dcmdata/dctk.h>
 #include <dcmtk/dcmdata/dcxfer.h>
+#include <dcmtk/dcmdata/dcistrmb.h>
 
 #include <dcmtk/dcmdata/dcpixel.h>
 #include <dcmtk/dcmdata/dcpixseq.h>
@@ -93,6 +94,7 @@ struct DicomFileImpl {
     int               kind          = KIND_UNCOMPRESSED;
     bool              decompressed  = false;  // KIND_OTHER: chooseRepresentation done
     DcmPixelSequence* pix_seq       = nullptr;// KIND_J2K: cached encapsulated sequence
+    long long         read_ns_      = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -281,6 +283,78 @@ static bool decode_jpeg2000(
     return true;
 }
 
+#include <chrono>
+#include <thread>
+#include <dcmtk/dcmdata/dcistrmf.h>
+#include <intrin.h>
+
+class TimedFileProducer : public DcmFileProducer {
+    long long* shared_read_ns_;
+    unsigned long long start_cycles_ = 0;
+public:
+    TimedFileProducer(const OFFilename &filename, offile_off_t offset, long long* shared_read_ns)
+        : DcmFileProducer(filename, offset), shared_read_ns_(shared_read_ns) {}
+
+    virtual offile_off_t read(void *buf, offile_off_t buflen) override {
+        unsigned long long t0 = __rdtsc();
+        offile_off_t res = DcmFileProducer::read(buf, buflen);
+        unsigned long long t1 = __rdtsc();
+        *shared_read_ns_ += (t1 - t0); // Accumulating CYCLES temporarily
+        return res;
+    }
+    virtual offile_off_t skip(offile_off_t skiplen) override {
+        unsigned long long t0 = __rdtsc();
+        offile_off_t res = DcmFileProducer::skip(skiplen);
+        unsigned long long t1 = __rdtsc();
+        *shared_read_ns_ += (t1 - t0);
+        return res;
+    }
+};
+
+class TimedInputStreamFactory : public DcmInputStreamFactory {
+    OFFilename filename_;
+    offile_off_t offset_;
+    long long* shared_read_ns_;
+public:
+    TimedInputStreamFactory(const OFFilename &filename, offile_off_t offset, long long* shared_read_ns)
+        : filename_(filename), offset_(offset), shared_read_ns_(shared_read_ns) {}
+    
+    virtual DcmInputStream *create() const override;
+    
+    virtual DcmInputStreamFactory *clone() const override {
+        return new TimedInputStreamFactory(filename_, offset_, shared_read_ns_);
+    }
+    virtual DcmInputStreamFactoryType ident() const override {
+        return DFT_DcmInputFileStreamFactory;
+    }
+};
+
+class TimedInputStream : public DcmInputStream {
+    TimedFileProducer producer_;
+    OFFilename filename_;
+    offile_off_t offset_;
+    long long* shared_read_ns_;
+public:
+    TimedInputStream(const OFFilename &filename, offile_off_t offset, long long* shared_read_ns)
+        : DcmInputStream(&producer_), producer_(filename, offset, shared_read_ns), filename_(filename), offset_(offset), shared_read_ns_(shared_read_ns) {}
+
+    virtual DcmInputStreamFactory *newFactory() const override {
+        return new TimedInputStreamFactory(filename_, offset_, shared_read_ns_);
+    }
+};
+
+DcmInputStream *TimedInputStreamFactory::create() const {
+    return new TimedInputStream(filename_, offset_, shared_read_ns_);
+}
+
+static double s_cycles_per_us = 0;
+
+long long DicomSource::get_last_read_us() const
+{
+    if (s_cycles_per_us == 0) return 0;
+    return (long long)(impl_->read_ns_ / s_cycles_per_us);
+}
+
 // ---------------------------------------------------------------------------
 // DicomSource ctor/dtor (defined here where DicomFileImpl is complete)
 // ---------------------------------------------------------------------------
@@ -290,18 +364,47 @@ DicomSource::~DicomSource() = default;
 // ---------------------------------------------------------------------------
 // DicomSource::open — parse metadata + frame count; no pixel decode
 // ---------------------------------------------------------------------------
+
 bool DicomSource::open(const char* path)
 {
-    // Register DCMTK codecs for JPEG / JPEG-LS / RLE (not JPEG2000 — we bypass
-    // DCMTK for that and call OpenJPEG directly).
-    std::call_once(s_codecs_once, register_dcmtk_codecs);
+    std::call_once(s_codecs_once, []() {
+        register_dcmtk_codecs();
+        auto t0 = std::chrono::high_resolution_clock::now();
+        unsigned long long c0 = __rdtsc();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        unsigned long long c1 = __rdtsc();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        long long us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        s_cycles_per_us = (double)(c1 - c0) / us;
+    });
 
     DicomFileImpl& F = *impl_;
-
-    OFCondition status = F.file_format.loadFile(path);
+    F.read_ns_ = 0;
+    
+    TimedInputStream inStream(path, 0, &F.read_ns_);
+    OFCondition status = F.file_format.read(inStream, EXS_Unknown, EGL_noChange, DCM_MaxReadLength);
     if (status.bad()) {
         fprintf(stderr, "DICOM: cannot load '%s': %s\n", path, status.text());
         return false;
+    }
+    
+    return open_memory(nullptr, 0, path); // Hack to jump to the rest of the parsing logic
+}
+
+bool DicomSource::open_memory(const uint8_t* data, size_t size, const char* path)
+{
+    std::call_once(s_codecs_once, register_dcmtk_codecs);
+    DicomFileImpl& F = *impl_;
+
+    if (data) {
+        DcmInputBufferStream ibs;
+        ibs.setBuffer(data, size);
+        ibs.setEos();
+        OFCondition status = F.file_format.read(ibs);
+        if (status.bad()) {
+            fprintf(stderr, "DICOM: cannot parse from memory: %s\n", status.text());
+            return false;
+        }
     }
 
     if (F.file_format.getMetaInfo())

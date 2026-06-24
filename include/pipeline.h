@@ -3,7 +3,7 @@
 
 struct ImageSource;  // forward declaration — full definition in image_source.h
 
-enum class ExportFormat { PNG, BMP };
+enum class ExportFormat { PNG, BMP, JLS };
 
 struct PipelineConfig {
     // Rows per GPU strip. 0 = auto: resolved once, right after CLI parsing,
@@ -42,8 +42,24 @@ struct PipelineConfig {
     // first strip to stdout after encoding (requires --verbose). Useful to
     // confirm the match finder is producing valid back-references.
     bool gpu_lz77_debug   = false;
-    // Export format: PNG (default) or BMP (fast, uncompressed, benchmark path).
+    // Export format: PNG (default), BMP (fast uncompressed), or JLS (JPEG-LS lossless).
     ExportFormat format   = ExportFormat::PNG;
+    // Use GPU JPEG-LS pipeline (G1–G5 kernels) instead of CPU CharLS.
+    // Only effective when format == ExportFormat::JLS.
+    bool use_gpu_jls      = false;
+    // JLS-C1: use ROW_CARRY context propagation in G2 instead of ROW_RESET.
+    // Only effective when use_gpu_jls is also true.
+    // Rows execute sequentially in stream order; produces spec-compliant
+    // context carry and materially smaller output. Enable with --gpu-jls-carry.
+    bool use_gpu_jls_carry  = false;
+    // JLS-C1 v3: GPU for G1 only; CPU does G2 + full ISO run-mode coding.
+    // Produces spec-compliant run-mode → smaller output than ROW_RESET.
+    // Enable with --gpu-jls-cpu-rm. Mutually exclusive with --gpu-jls-carry.
+    bool use_gpu_jls_cpu_rm = false;
+    // GPU BMP: move Window/Level, Rescale, Normalization, and 16→8 conversion
+    // to GPU (bmp_dicom_to_gray8_kernel). CPU retains DICOM decode + BMP write.
+    // Enable with --gpu-bmp. Only effective for 16-bit grayscale DICOM sources.
+    bool use_gpu_bmp = false;
 };
 
 // ---- PNG encode (lossless, compressed) ------------------------------------
@@ -75,24 +91,51 @@ bool encode_dicom_all_frames_to_png(const char* input_path,
                                     const char* output_dir,
                                     const PipelineConfig& cfg);
 
-// GPU-deflate batch profiling. Call reset before the batch starts and
-// print_summary after all files finish. No-ops when use_gpu_deflate is false
-// (the accumulator is never written to in that case).
+// Batch telemetry — call reset before the batch, print_batch_summary after.
+// Always active for all formats (BMP, JLS CPU, JLS GPU, PNG CPU, PNG GPU).
 void pipeline_reset_gpu_batch_stats();
 
-// Record per-file lifecycle timings for the consistency report.
-// Call once per file from inside encode_*_to_png() when use_gpu_deflate=true.
-//   dicom_ms  - DICOM open + load_frame time (0 for TIFF/RAW).
-//   total_ms  - encode_*_to_png() entry → return (dicom + pipeline).
-void pipeline_record_file_times(long long dicom_ms, long long total_ms);
+struct FileTelemetry {
+    // Input I/O breakdown (from decode_dicom_to_frame)
+    long long file_open_us    = 0;
+    long long file_read_us    = 0;
+    long long dicom_parse_us  = 0;
+    long long pixel_decode_us = 0;
+    // Processing breakdown (from encode_predecoded_dicom)
+    long long encode_us       = 0;  // CPU encode: CharLS, BMP convert, PNG filter+compress
+    long long write_us        = 0;  // output file write (separated where possible)
+    // GPU JLS per-phase (µs) — only populated for use_gpu_jls paths
+    long long jls_h2d_us      = 0;  // H2D pixel copy
+    long long jls_g1_us       = 0;  // G1 LOCO-I kernel
+    long long jls_g2_us       = 0;  // G2 Golomb-k (ROW_RESET) or D2H residuals (CPU_RM)
+    long long jls_g3_us       = 0;  // G3 bit-lengths (ROW_RESET only)
+    long long jls_g4_us       = 0;  // G4 prefix scan (ROW_RESET only)
+    long long jls_g5_us       = 0;  // G5 bit-emit (ROW_RESET only)
+    long long jls_d2h_us      = 0;  // D2H bitstream (ROW_RESET only)
+    long long jls_cpu_wrap_us = 0;  // byte-stuff+write (ROW_RESET) or encode+write (CPU_RM)
+    // GPU BMP per-phase (µs) — only populated when use_gpu_bmp is true
+    long long bmp_h2d_us      = 0;  // H2D: pixels to device
+    long long bmp_kernel_us   = 0;  // window/level + 16→8 conversion kernel
+    long long bmp_d2h_us      = 0;  // D2H: 8-bit output to host
+    long long total_ms        = 0;
+};
 
-// sum_file_batch_ms: sum of per-file wall times as seen by batch_processor.cpp
-//   (independent ground truth for the TIMING CONSISTENCY REPORT).
-// num_workers: number of concurrent worker threads used for the batch.
-void pipeline_print_gpu_batch_summary(int total_files, int succeeded,
-                                      double total_wall_s,
-                                      long long sum_file_batch_ms,
-                                      int num_workers);
+// Record per-file lifecycle timings into the global batch accumulator.
+// Call once per file from the encode worker (all formats).
+void pipeline_record_file_times(const FileTelemetry& t);
+
+// Print the full input/processing/output telemetry breakdown for the completed batch.
+// fmt / use_gpu_deflate / use_gpu_jls / use_gpu_jls_cpu_rm determine which
+// format-specific processing section is shown.
+void pipeline_print_batch_summary(int total_files, int succeeded,
+                                  double total_wall_s,
+                                  long long sum_file_batch_ms,
+                                  int num_workers,
+                                  ExportFormat fmt,
+                                  bool use_gpu_deflate,
+                                  bool use_gpu_jls,
+                                  bool use_gpu_jls_cpu_rm,
+                                  bool use_gpu_bmp);
 
 // ---- BMP encode (lossless, uncompressed, fastest export path) -------------
 // Converts all inputs to 8-bit grayscale (1-channel) or 24-bit BGR (3-channel).

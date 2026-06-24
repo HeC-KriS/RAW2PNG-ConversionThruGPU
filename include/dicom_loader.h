@@ -33,6 +33,9 @@ struct DicomSource : ImageSource {
     // Parse headers, transfer syntax, and NumberOfFrames. No pixel decode yet.
     bool open(const char* path);
 
+    // Parse DICOM directly from memory buffer
+    bool open_memory(const uint8_t* data, size_t size, const char* path = "<memory>");
+
     // Decode/extract frame `index` (0-based) into pixel_data_ and reset the
     // strip cursor. Returns false on error.
     bool load_frame(int index);
@@ -41,4 +44,6 @@ struct DicomSource : ImageSource {
     const DicomPixelParams* dicom_params() const override { return &params_;    }
     int                     num_frames()   const override { return num_frames_; }
     int read_strip(uint8_t* out, int max_rows) override;
+    
+    long long get_last_read_us() const;
 };

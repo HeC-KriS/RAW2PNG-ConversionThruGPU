@@ -18,6 +18,13 @@ struct BatchConfig {
     int  num_workers   = 0;     // 0 = auto: min(hardware_concurrency, file_count, 4)
     bool batch_verbose = false; // append per-file wall time to each progress line;
                                 // the aggregate summary always prints regardless
+    // Architecture J: batch size for concurrent GPU dispatch.
+    // 0 = Architecture D (one-at-a-time per worker, current default).
+    // >1 = Architecture J: accumulate N decoded frames then launch all N GPU
+    //      streams simultaneously, amortizing per-image GPU sync overhead.
+    //      Typical values: GT710=8, RTX5050=32.  Auto-selected when --batch-size
+    //      is not passed (0 means "use Architecture D, no batching").
+    int  batch_size    = 0;
 };
 
 // Encode every supported file in input_dir to output_dir (created if needed).

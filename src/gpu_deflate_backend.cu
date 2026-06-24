@@ -737,12 +737,12 @@ __global__ void lz77_row_kernel(
     const int row = blockIdx.x;
     if (row >= actual_rows) return;
 
-    // Shared hash table: 1024 × uint32_t = 4 KB per block
-    __shared__ uint32_t s_hash[SEQ_HASH_SIZE];
+    // Shared hash table: 1024 × 4 × uint32_t = 16 KB per block
+    __shared__ uint32_t s_hash[SEQ_HASH_SIZE][4];
 
-    // Parallel init: each of the 32 threads clears 32 entries
-    for (int i = threadIdx.x; i < SEQ_HASH_SIZE; i += blockDim.x)
-        s_hash[i] = 0xFFFFFFFFu;
+    // Parallel init: each of the 32 threads clears 128 entries
+    for (int i = threadIdx.x; i < SEQ_HASH_SIZE * 4; i += blockDim.x)
+        ((uint32_t*)s_hash)[i] = 0xFFFFFFFFu;
     __syncthreads();
 
     if (threadIdx.x != 0) return;   // only thread 0 scans
@@ -778,56 +778,65 @@ __global__ void lz77_row_kernel(
         }
         const uint32_t h = (v * 2654435761u) >> (32 - SEQ_HASH_BITS);
 
-        const uint32_t cand = s_hash[h];   // most recent occupant of this bucket
-        s_hash[h] = (uint32_t)pos;          // update: this position takes the slot
+        uint32_t cands[4];
+        cands[0] = s_hash[h][0];
+        cands[1] = s_hash[h][1];
+        cands[2] = s_hash[h][2];
+        cands[3] = s_hash[h][3];
 
-        if (cand == 0xFFFFFFFFu) {
+        s_hash[h][3] = cands[2];
+        s_hash[h][2] = cands[1];
+        s_hash[h][1] = cands[0];
+        s_hash[h][0] = (uint32_t)pos;
+
+        int best_len = 0;
+        int best_dist = 0;
+
+        for (int i = 0; i < 4; i++) {
+            const uint32_t cand = cands[i];
+            if (cand == 0xFFFFFFFFu) break;
+
+            const int dist = (int)pos - (int)cand;
+            if (dist > LZ_MAX_DIST) continue;
+
+            if (src[cand]     != src[pos]     ||
+                src[cand + 1] != src[pos + 1] ||
+                src[cand + 2] != src[pos + 2]) {
+                continue;
+            }
+
+            const int max_len_here = (row_bytes - pos < LZ_MAX_MATCH)
+                                     ? (row_bytes - pos) : LZ_MAX_MATCH;
+            int len = LZ_MIN_MATCH;
+            while (len < max_len_here && src[cand + len] == src[pos + len])
+                len++;
+
+            if (len > best_len) {
+                best_len = len;
+                best_dist = dist;
+            }
+            if (len == max_len_here) break;
+        }
+
+        if (best_len == 0) {
             o_len[pos] = 1;
             pos++;
             continue;
         }
-
-        // Sequential scan guarantees cand < pos (no forward-reference check needed)
-        const int dist = (int)pos - (int)cand;
-        if (dist > LZ_MAX_DIST) {
-            o_len[pos] = 1;
-            pos++;
-            continue;
-        }
-
-        // Quick 3-byte content check (all three positions are guaranteed in-bounds
-        // since pos + LZ_MIN_MATCH <= row_bytes, and cand < pos < row_bytes)
-        if (src[cand]     != src[pos]     ||
-            src[cand + 1] != src[pos + 1] ||
-            src[cand + 2] != src[pos + 2]) {
-            // Hash collision: bucket holds a different 3-byte sequence
-            o_len[pos] = 1;
-            pos++;
-            continue;
-        }
-
-        // Extend match as far as possible up to LZ_MAX_MATCH or row boundary.
-        // Bounds proof: pos+len < row_bytes (len < max_len_here = row_bytes-pos),
-        //               cand+len < pos+len < row_bytes (because cand < pos).
-        const int max_len_here = (row_bytes - pos < LZ_MAX_MATCH)
-                                 ? (row_bytes - pos) : LZ_MAX_MATCH;
-        int len = LZ_MIN_MATCH;
-        while (len < max_len_here && src[cand + len] == src[pos + len])
-            len++;
 
         // Write match token and mark continuation bytes as 0 (skip)
-        o_len[pos]  = (uint16_t)len;
-        o_dist[pos] = (uint16_t)dist;
-        for (int k = 1; k < len; k++) o_len[pos + k] = 0;
+        o_len[pos]  = (uint16_t)best_len;
+        o_dist[pos] = (uint16_t)best_dist;
+        for (int k = 1; k < best_len; k++) o_len[pos + k] = 0;
 
         // Accumulate per-row stats in registers (avoids one global atomic per match)
         row_matches++;
-        row_mbytes   += (uint32_t)len;
-        if ((uint32_t)len > row_max_len) row_max_len = (uint32_t)len;
-        row_len_sum  += (uint64_t)len;
-        row_dist_sum += (uint64_t)dist;
+        row_mbytes   += (uint32_t)best_len;
+        if ((uint32_t)best_len > row_max_len) row_max_len = (uint32_t)best_len;
+        row_len_sum  += (uint64_t)best_len;
+        row_dist_sum += (uint64_t)best_dist;
 
-        pos += len;
+        pos += best_len;
     }
 
     // One global atomic per counter per row (not per match) — low contention

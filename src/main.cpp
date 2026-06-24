@@ -62,8 +62,11 @@ static void usage(const char* prog)
         "  --no-gpu-lz77        disable GPU LZ77 (keep literal-only GPU deflate)\n"
         "  --gpu-lz77-debug     with --gpu-lz77 --verbose: print match stats and\n"
         "                       confirm matches are valid back-references\n"
-        "  --format png|bmp     output format (default: png)\n"
+        "  --format png|bmp|jls output format (default: png)\n"
         "                       bmp: fastest path, lossless, uncompressed 8-bit gray/24-bit BGR\n"
+        "                       jls: JPEG-LS lossless, 8-bit grayscale, CPU-only path\n"
+        "  --gpu-bmp            move Window/Level + 16->8 conversion to GPU for BMP export\n"
+        "                       (H2D -> bmp_dicom_to_gray8 kernel -> D2H -> CPU write)\n"
         "  --benchmark-decode   decode-only mode: open + decompress pixels, no encode/write.\n"
         "                       Measures true DCMTK/libtiff/LibRaw ingest ceiling and\n"
         "                       worker utilization. Works in folder and single-file modes.\n"
@@ -121,6 +124,8 @@ int main(int argc, char* argv[])
             batch_cfg.num_workers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--batch-verbose") == 0)
             batch_cfg.batch_verbose = true;
+        else if (strcmp(argv[i], "--batch-size") == 0 && i + 1 < argc)
+            batch_cfg.batch_size = atoi(argv[++i]);
         else if (strcmp(argv[i], "--gpu-streams") == 0 && i + 1 < argc)
             cfg.gpu_streams = atoi(argv[++i]);
         else if (strcmp(argv[i], "--gpu-deflate") == 0)
@@ -131,6 +136,14 @@ int main(int argc, char* argv[])
             cfg.use_gpu_lz77 = false;
         else if (strcmp(argv[i], "--gpu-lz77-debug") == 0)
             cfg.gpu_lz77_debug = true;
+        else if (strcmp(argv[i], "--gpu-jls") == 0)
+            cfg.use_gpu_jls = true;
+        else if (strcmp(argv[i], "--gpu-jls-carry") == 0)
+            cfg.use_gpu_jls_carry = true;
+        else if (strcmp(argv[i], "--gpu-jls-cpu-rm") == 0)
+            cfg.use_gpu_jls_cpu_rm = true;
+        else if (strcmp(argv[i], "--gpu-bmp") == 0)
+            cfg.use_gpu_bmp = true;
         else if (strcmp(argv[i], "--benchmark-decode") == 0)
             benchmark_decode = true;
         else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
@@ -139,8 +152,10 @@ int main(int argc, char* argv[])
                 cfg.format = ExportFormat::PNG;
             else if (strcmp(fmt, "bmp") == 0 || strcmp(fmt, "BMP") == 0)
                 cfg.format = ExportFormat::BMP;
+            else if (strcmp(fmt, "jls") == 0 || strcmp(fmt, "JLS") == 0)
+                cfg.format = ExportFormat::JLS;
             else {
-                fprintf(stderr, "Unknown format '%s'. Supported: png, bmp\n", fmt);
+                fprintf(stderr, "Unknown format '%s'. Supported: png, bmp, jls\n", fmt);
                 return 1;
             }
         }
